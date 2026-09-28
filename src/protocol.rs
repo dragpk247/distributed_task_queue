@@ -5,6 +5,7 @@ use std::io::{Error, ErrorKind};
 pub enum Command {
     Lpush { queue: String, payload: Vec<u8> },
     Rpop { queue: String },
+    Rpoplpush { source: String, destination: String },
     Ping,
     Unknown,
 }
@@ -94,6 +95,11 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<Command>, Error> {
         "RPOP" if args.len() == 2 => {
             let queue = String::from_utf8_lossy(&args[1]).into_owned();
             Ok(Some(Command::Rpop { queue }))
+        }
+        "RPOPLPUSH" if args.len() == 3 => {
+            let source = String::from_utf8_lossy(&args[1]).into_owned();
+            let destination = String::from_utf8_lossy(&args[2]).into_owned();
+            Ok(Some(Command::Rpoplpush { source, destination }))
         }
         _ => Ok(Some(Command::Unknown)),
     }

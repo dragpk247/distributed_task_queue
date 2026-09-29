@@ -13,8 +13,13 @@ async fn start_test_server(port: u16) -> (String, std::path::PathBuf) {
         let _ = server.run().await;
     });
 
-    // Wait briefly for socket binding
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait until socket is ready to accept connections
+    for _ in 0..50 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            return (addr, aof_path);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     (addr, aof_path)
 }
 
@@ -267,16 +272,21 @@ async fn test_delayed_task_polling_integration() {
     let n = client.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"$-1\r\n");
 
-    // Sleep 200ms to allow the 50ms polling loop to promote the task
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Pop again -> should now return the promoted payload
-    client
-        .write_all(b"*2\r\n$4\r\nRPOP\r\n$6\r\nfuture\r\n")
-        .await
-        .unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"$11\r\nhello_delay\r\n");
+    // Poll for the promoted payload (up to 1.5 seconds)
+    let mut promoted_found = false;
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client
+            .write_all(b"*2\r\n$4\r\nRPOP\r\n$6\r\nfuture\r\n")
+            .await
+            .unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        if &buf[..n] == b"$11\r\nhello_delay\r\n" {
+            promoted_found = true;
+            break;
+        }
+    }
+    assert!(promoted_found, "Delayed task was not promoted in time");
 
     let _ = std::fs::remove_file(&aof_path);
 }

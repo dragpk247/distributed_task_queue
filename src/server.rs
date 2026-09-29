@@ -166,25 +166,31 @@ pub async fn handle_connection(
         while !buffer.is_empty() {
             match parse_command(&mut buffer) {
                 Ok(Some((command, raw_frame))) => {
-                    // Check authentication status
+                    // ---------------------------------------------------------
+                    // 1. Authentication Check & Session Validation
+                    // ---------------------------------------------------------
                     if let Command::Auth { password } = &command {
                         if ctx.requirepass.as_deref() == Some(password.as_str()) {
+                            // Password matches configured --requirepass
                             authenticated = true;
                             socket.write_all(&resp_simple_string("OK")).await?;
                         } else if ctx.requirepass.is_none() {
+                            // Client attempted AUTH on a server without password configured
                             socket
                                 .write_all(&resp_error("ERR Client sent AUTH, but no password is set"))
                                 .await?;
                         } else {
+                            // Invalid password provided
                             socket
                                 .write_all(&resp_error(
                                     "WRONGPASS invalid username-password pair or token",
-                                ))
+                                 ))
                                 .await?;
                         }
                         continue;
                     }
 
+                    // Block all commands except PING if connection has not authenticated
                     if !authenticated && !matches!(command, Command::Ping) {
                         socket
                             .write_all(&resp_error("NOAUTH Authentication required."))
@@ -192,8 +198,11 @@ pub async fn handle_connection(
                         continue;
                     }
 
+                    // ---------------------------------------------------------
+                    // 2. Command Execution & State Dispatch
+                    // ---------------------------------------------------------
                     match command {
-                        // Health check
+                        // Health check probe (accessible unauthenticated)
                         Command::Ping => {
                             socket.write_all(&resp_simple_string("PONG")).await?;
                         }
@@ -427,16 +436,20 @@ pub async fn handle_connection(
                             socket.write_all(&resp_simple_string("OK")).await?;
                         }
 
-                        // Push item with delayed execution
+                        // Schedule an item with a future execution delay (min-heap priority queue)
                         Command::LpushDelay {
                             queue,
                             delay_secs,
                             payload,
                         } => {
+                            // Convert floating point seconds into std::time::Duration (clamp negative to 0)
                             let duration = Duration::from_secs_f64(delay_secs.max(0.0));
+                            // Enqueue task into Engine's min-heap and receive unique assigned task ID
                             let task_id = ctx.engine.lpush_delayed(&queue, duration, payload.clone());
+                            // Persist delayed task schedule to AOF log and mirror to connected replicas
                             let _ = ctx.aof.append(&raw_frame);
                             let _ = ctx.replica_stream.send(raw_frame);
+                            // Return the assigned scheduled task ID as a RESP Integer (:id\r\n)
                             socket.write_all(&resp_integer(task_id as i64)).await?;
                         }
 

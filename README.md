@@ -21,40 +21,88 @@ A high-performance, asynchronous distributed task queue engine built in Rust, po
 
 ---
 
-## 🏗️ Architecture
+### 🏗️ System Architecture & Workflow Diagrams
 
-```text
-       Client (redis-cli / worker / producer)
-                         │
-                         ▼ [TCP :6379]
-               ┌───────────────────┐
-               │ Tokio TCP Listener│
-               └─────────┬─────────┘
-                         │ spawns per connection
-                         ▼
-               ┌───────────────────┐
-               │  Connection Loop  │ ──► Reads into BytesMut buffer
-               └─────────┬─────────┘
-                         │ Frame Parser (RESP)
-                         ▼
-        ┌────────────────────────────────────────────────────────┐
-        │                  Queue Engine                          │
-        │                                                        │
-        │ ┌─────────────────────────┐  ┌───────────────────────┐ │
-        │ │ FIFO Queues (TaskItem)  │  │ In-Flight Leases      │ │
-        │ └───────────┬─────────────┘  └──────────┬────────────┘ │
-        │             │                           │              │
-        │             ▼                           ▼              │
-        │ ┌─────────────────────────┐  ┌───────────────────────┐ │
-        │ │ Broadcast Notifier      │  │ Dead Letter Queues    │ │
-        │ └─────────────────────────┘  └───────────────────────┘ │
-        └──────────────┬──────────────────────────┬──────────────┘
-                       │                          │
-                       ▼                          ▼
-          ┌─────────────────────────┐   ┌───────────────────┐
-          │  AOF Persistence Engine │   │ Replica Stream tx │
-          │ (Replay & Compaction)   │   │  (SYNC Protocol)  │
-          └─────────────────────────┘   └───────────────────┘
+### 1. High-Level Node Architecture
+
+```mermaid
+graph TD
+    Client["Client / Worker / Producer (redis-cli / SDK)"]
+    Listener["Tokio TCP Listener (:6379)"]
+    Conn["Connection Task (handle_connection)"]
+    Auth{"Authenticated?"}
+    Parser["RESP Wire Protocol Parser"]
+    Engine["QueueEngine (parking_lot::RwLock)"]
+    Queues[("FIFO Queues\nVecDeque<TaskItem>")]
+    Delayed[("Scheduled Tasks\nMin-Heap BinaryHeap")]
+    Leases[("In-Flight Leases\nHashMap<task_id, InFlightTask>")]
+    DLQ[("Dead-Letter Queue (DLQ)\nVec<TaskItem>")]
+    AOF[("AOF Persistence Engine\n(Fsync & Replay)")]
+    Notifier["Broadcast Channel\n(BRPOP Notifier)"]
+    Replication["Replica Broadcast Stream\n(SYNC Master)"]
+    Follower["Replica Follower\n(--replicaof)"]
+
+    Client -->|TCP Socket| Listener
+    Listener -->|Spawns| Conn
+    Conn -->|BytesMut| Parser
+    Parser --> Auth
+    Auth -->|No & not PING/AUTH| ErrNOAUTH["-NOAUTH Error"]
+    Auth -->|Yes| Engine
+
+    Engine --> Queues
+    Engine --> Delayed
+    Engine --> Leases
+    Engine --> DLQ
+
+    Engine -->|Notify Push| Notifier
+    Conn -->|Mutation Frame| AOF
+    Conn -->|Mutation Frame| Replication
+    Replication -->|Raw Stream| Follower
+
+    subgraph Background Timers
+        Reaper["Lease Reaper\n(Every 1s)"] -->|Reclaim / DLQ| Leases
+        Scheduler["Delayed Scheduler\n(Every 50ms)"] -->|Promote Mature Tasks| Delayed
+        Scheduler -->|Enqueue Ready| Queues
+    end
+```
+
+### 2. Task Lifecycle & Lease State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Scheduled: LPUSH_DELAY (execute_at > now)
+    Scheduled --> Ready: 50ms Scheduler promotes task
+    [*] --> Ready: LPUSH (immediate)
+    
+    Ready --> InFlight: RPOPLEASE / BRPOPLEASE
+    
+    InFlight --> InFlight: TASKTOUCH (Extend Visibility Timeout)
+    InFlight --> Completed: TASKACK (Success)
+    Completed --> [*]
+    
+    InFlight --> Ready: TASKNACK / Lease Reaper Expiry (retries < max_retries)
+    InFlight --> DeadLetterQueue: TASKNACK / Lease Reaper Expiry (retries >= max_retries)
+    DeadLetterQueue --> [*]: Inspection / Alerting
+```
+
+### 3. Primary-Replica Synchronization (`SYNC` / `--replicaof`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Master as Primary Master (:6379)
+    participant Replica as Follower Replica (:6380)
+    participant Client as Client Producer
+
+    Replica->>Master: Connects via TCP
+    Replica->>Master: *1\r\n$4\r\nSYNC\r\n
+    Master-->>Replica: +SYNC OK\r\n
+    
+    Client->>Master: LPUSH tasks "send_email"
+    Master->>Master: Append to Local Engine & AOF
+    Master-->>Client: :1\r\n (Queue Length)
+    Master-)Replica: Broadcast *3\r\n$5\r\nLPUSH\r\n$5\r\ntasks\r\n$10\r\nsend_email\r\n
+    Replica->>Replica: Applies LPUSH to Follower Engine
 ```
 
 ---
@@ -64,7 +112,9 @@ A high-performance, asynchronous distributed task queue engine built in Rust, po
 | Command | Syntax | Description |
 | :--- | :--- | :--- |
 | `PING` | `PING` | Health check probe (returns `+PONG`) |
+| `AUTH` | `AUTH <password>` | Authenticate client session when `--requirepass` is set |
 | `LPUSH` | `LPUSH <queue> <payload>` | Push element to the head of the queue |
+| `LPUSH_DELAY` | `LPUSH_DELAY <queue> <delay_secs> <payload>` | Schedule an item to be enqueued after `delay_secs` |
 | `RPOP` | `RPOP <queue>` | Pop element from the tail of the queue |
 | `RPOPLEASE` | `RPOPLEASE <queue> [visibility_secs]` | Atomically pop and lease task with unique Task ID & visibility timeout |
 | `BRPOPLEASE` | `BRPOPLEASE <queue> <timeout> [visibility_secs]` | Non-busy blocking pop with lease & Task ID |
@@ -108,39 +158,49 @@ Clone the repository and launch the server:
 git clone https://github.com/dragpk247/distributed_task_queue.git
 cd distributed_task_queue
 
-# Run in debug mode with info logging enabled
-RUST_LOG=info cargo run -- --bind 127.0.0.1:6379 --aof queue_persistence.aof
+# Run primary master with optional password protection
+cargo run -- --bind 127.0.0.1:6379 --requirepass secret123
 
-# Or build optimized release binary
-cargo build --release
-./target/release/distributed_task_queue --bind 127.0.0.1:6379
+# Run replica follower connecting to primary
+cargo run -- --bind 127.0.0.1:6380 --replicaof 127.0.0.1:6379
 ```
 
 ### Interacting via redis-cli
 
 ```bash
-# Push tasks
+# 1. Authenticate (if --requirepass configured)
+redis-cli -p 6379 AUTH secret123
+
+# 2. Push immediate tasks
 redis-cli -p 6379 LPUSH jobs "process_video_1"
-redis-cli -p 6379 LPUSH jobs "generate_report_2"
 
-# Non-blocking pop
-redis-cli -p 6379 RPOP jobs
+# 3. Schedule delayed task (runs in 10 seconds)
+redis-cli -p 6379 LPUSH_DELAY jobs 10.0 "reminder_email_worker"
 
-# Blocking pop (waits up to 10 seconds for a task)
+# 4. Lease task with 30-second visibility timeout
+redis-cli -p 6379 RPOPLEASE jobs 30
+
+# 5. Heartbeat / extend lease
+redis-cli -p 6379 TASKTOUCH jobs task-1 30
+
+# 6. Settle task
+redis-cli -p 6379 TASKACK jobs task-1
+
+# 7. Non-busy blocking pop (waits up to 10 seconds)
 redis-cli -p 6379 BRPOP jobs 10
 
-# Trigger AOF compaction
+# 8. Trigger AOF compaction
 redis-cli -p 6379 BGREWRITEAOF
 ```
 
 ### Running Test Suite
 
 ```bash
-# Run unit and integration tests
+# Run unit and integration tests (25 passing tests)
 cargo test
 
 # Run linter
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
 
 ---

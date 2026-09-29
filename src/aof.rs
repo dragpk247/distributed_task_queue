@@ -1,3 +1,11 @@
+//! # Append-Only File (AOF) Persistence Module
+//!
+//! Provides durable mutation logging and crash-recovery snapshotting:
+//! - Appends raw RESP command frames directly to physical disk ledger.
+//! - Startup recovery: replays logged frames sequentially to reconstruct state.
+//! - Online AOF compaction (`BGREWRITEAOF`): writes clean, minimal state to a temporary file
+//!   and atomically swaps files via OS `rename` to prevent disk bloat.
+
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -9,13 +17,18 @@ use parking_lot::Mutex;
 use crate::engine::{TaskItem, DEFAULT_MAX_RETRIES};
 use crate::protocol::{parse_command, Command};
 
+/// Manages the physical append-only transaction file on disk.
 pub struct AofManager {
+    /// Filesystem path to the active `.aof` file.
     file_path: PathBuf,
+    /// Thread-safe file handle for append mutations.
     writer: Mutex<File>,
+    /// Rolling counter of recorded mutation transactions.
     mutation_count: AtomicUsize,
 }
 
 impl AofManager {
+    /// Opens or creates the AOF ledger at the given path in append mode.
     pub fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let file_path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
@@ -31,7 +44,7 @@ impl AofManager {
         })
     }
 
-    /// Append raw RESP frame directly to the persistence ledger
+    /// Appends a raw RESP command frame directly to the persistence ledger.
     pub fn append(&self, raw_frame: &[u8]) -> std::io::Result<()> {
         let mut lock = self.writer.lock();
         lock.write_all(raw_frame)?;
@@ -40,7 +53,7 @@ impl AofManager {
         Ok(())
     }
 
-    /// Replay the AOF file to restore in-memory queue states on startup
+    /// Replays the AOF ledger sequentially upon server startup to reconstruct in-memory queues.
     pub fn replay(&self) -> std::io::Result<HashMap<String, VecDeque<TaskItem>>> {
         let mut queues: HashMap<String, VecDeque<TaskItem>> = HashMap::new();
         let file = OpenOptions::new().read(true).open(&self.file_path);
@@ -53,6 +66,7 @@ impl AofManager {
         let mut buffer = BytesMut::from(&file_bytes[..]);
         let mut count = 0;
 
+        // Parse and replay commands in exact historical order
         while !buffer.is_empty() {
             match parse_command(&mut buffer) {
                 Ok(Some((cmd, _))) => match cmd {
@@ -91,7 +105,11 @@ impl AofManager {
         Ok(queues)
     }
 
-    /// Compacts the current queue state into a temporary file and atomically replaces the AOF log
+    /// Compacts the current in-memory queue state into a temporary file and atomically
+    /// swaps it over the existing AOF log (`fs::rename`).
+    ///
+    /// This removes historical dead commands (e.g. pushed items that were subsequently popped),
+    /// bounding disk space usage.
     pub fn compact(&self, current_state: &HashMap<String, VecDeque<TaskItem>>) -> std::io::Result<usize> {
         let temp_path = self.file_path.with_extension("aof.tmp");
         let mut temp_file = OpenOptions::new()
@@ -102,7 +120,7 @@ impl AofManager {
 
         let mut written_commands = 0;
 
-        // For each queue, emit clean LPUSH commands in order
+        // Reconstruct minimal LPUSH frames for each active queue item in FIFO order
         for (queue, items) in current_state.iter() {
             for item in items.iter().rev() {
                 let frame = format!(
@@ -121,7 +139,7 @@ impl AofManager {
         temp_file.flush()?;
         drop(temp_file);
 
-        // Lock writer and atomically rename temp file over current AOF file
+        // Atomic file swap: replace the old AOF with the new compacted file
         let mut lock = self.writer.lock();
         std::fs::rename(&temp_path, &self.file_path)?;
 

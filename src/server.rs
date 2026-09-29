@@ -1,3 +1,12 @@
+//! # Server Module: Async TCP Server & Connection Lifecycle
+//!
+//! Handles incoming TCP connections from client producers, workers, and replicas:
+//! - Spawns a Tokio task per connected client socket.
+//! - Executes commands against the [`QueueEngine`].
+//! - Dispatches mutations to the [`AofManager`] persistence ledger.
+//! - Broadcasts mutations live to connected replicas over [`broadcast::Sender`].
+//! - Runs an autonomous background timer thread to reclaim expired visibility task leases.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,20 +22,27 @@ use crate::protocol::{
     resp_simple_string, Command,
 };
 
+/// Shared state available across all connection handler tasks.
 pub struct ServerContext {
+    /// In-memory queue storage and concurrency primitives.
     pub engine: Arc<QueueEngine>,
+    /// Append-only file persistence manager.
     pub aof: Arc<AofManager>,
-    /// Broadcast channel streaming raw mutations to any connected replicas
+    /// Broadcast channel streaming raw mutations to any connected replicas (`SYNC`).
     pub replica_stream: broadcast::Sender<Vec<u8>>,
+    /// Monotonically increasing atomic counter for generating distinct Task IDs (`task-1`, `task-2`, ...).
     pub task_counter: AtomicU64,
 }
 
+/// The main distributed task queue TCP server.
 pub struct Server {
     addr: String,
     context: Arc<ServerContext>,
 }
 
 impl Server {
+    /// Initializes the server, replays the existing AOF persistence ledger to restore state,
+    /// and configures background channels.
     pub fn new(addr: &str, aof_path: &str) -> std::io::Result<Self> {
         let aof = Arc::new(AofManager::open(aof_path)?);
         let restored_queues = aof.replay()?;
@@ -52,15 +68,17 @@ impl Server {
         })
     }
 
+    /// Access the underlying queue engine (useful for integration testing).
     pub fn get_engine(&self) -> Arc<QueueEngine> {
         Arc::clone(&self.context.engine)
     }
 
+    /// Starts the TCP listener event loop and launches the background lease reaper.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&self.addr).await?;
         tracing::info!("Server listening on {}", self.addr);
 
-        // Spawn background reaper for expired visibility timeouts
+        // Background worker: Periodically reclaims expired visibility timeout leases every 1 second
         let engine_clone = Arc::clone(&self.context.engine);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -73,6 +91,7 @@ impl Server {
             }
         });
 
+        // Main connection acceptance loop
         loop {
             let (socket, client_addr) = listener.accept().await?;
             tracing::debug!("New connection from: {}", client_addr);
@@ -87,6 +106,7 @@ impl Server {
     }
 }
 
+/// Asynchronous stream processor for an individual client connection.
 pub async fn handle_connection(
     mut socket: TcpStream,
     ctx: Arc<ServerContext>,
@@ -97,24 +117,30 @@ pub async fn handle_connection(
         let mut chunk = [0u8; 1024];
         let bytes_read = socket.read(&mut chunk).await?;
         if bytes_read == 0 {
-            return Ok(());
+            return Ok(()); // Client disconnected cleanly
         }
 
         buffer.extend_from_slice(&chunk[..bytes_read]);
 
+        // Process all complete frames currently in the buffer (supports pipelining)
         while !buffer.is_empty() {
             match parse_command(&mut buffer) {
                 Ok(Some((command, raw_frame))) => {
                     match command {
+                        // Health check
                         Command::Ping => {
                             socket.write_all(&resp_simple_string("PONG")).await?;
                         }
+
+                        // Push item to head of queue
                         Command::Lpush { queue, payload } => {
                             let len = ctx.engine.lpush(&queue, payload);
                             let _ = ctx.aof.append(&raw_frame);
                             let _ = ctx.replica_stream.send(raw_frame);
                             socket.write_all(&resp_integer(len as i64)).await?;
                         }
+
+                        // Pop item from tail of queue
                         Command::Rpop { queue } => {
                             let maybe_item = ctx.engine.rpop(&queue);
                             if let Some(item) = maybe_item {
@@ -125,6 +151,8 @@ pub async fn handle_connection(
                                 socket.write_all(&resp_null()).await?;
                             }
                         }
+
+                        // Atomic transfer between queues
                         Command::Rpoplpush { source, destination } => {
                             let maybe_item = ctx.engine.rpoplpush(&source, &destination);
                             if let Some(item) = maybe_item {
@@ -135,6 +163,8 @@ pub async fn handle_connection(
                                 socket.write_all(&resp_null()).await?;
                             }
                         }
+
+                        // Non-busy blocking pop across multiple queues
                         Command::Brpop {
                             queues,
                             timeout_secs,
@@ -142,7 +172,6 @@ pub async fn handle_connection(
                             let timeout = Duration::from_secs_f64(timeout_secs);
                             let maybe_item = ctx.engine.brpop(&queues, timeout).await;
                             if let Some((matched_queue, item)) = maybe_item {
-                                // Record pop into AOF
                                 let rpop_frame = format!(
                                     "*2\r\n$4\r\nRPOP\r\n${}\r\n{}\r\n",
                                     matched_queue.len(),
@@ -161,6 +190,8 @@ pub async fn handle_connection(
                                 socket.write_all(&resp_null()).await?;
                             }
                         }
+
+                        // Blocking transfer
                         Command::Brpoplpush {
                             source,
                             destination,
@@ -169,7 +200,6 @@ pub async fn handle_connection(
                             let timeout = Duration::from_secs_f64(timeout_secs);
                             let rx = ctx.engine.brpop(std::slice::from_ref(&source), timeout).await;
                             if let Some((_, item)) = rx {
-                                // Put to destination
                                 ctx.engine.lpush(&destination, item.clone());
                                 let rpoplpush_frame = format!(
                                     "*3\r\n$9\r\nRPOPLPUSH\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
@@ -186,6 +216,8 @@ pub async fn handle_connection(
                                 socket.write_all(&resp_null()).await?;
                             }
                         }
+
+                        // Pop with visibility timeout lease: returns [task_id, payload]
                         Command::RpopLease {
                             queue,
                             visibility_secs,
@@ -212,6 +244,8 @@ pub async fn handle_connection(
                                 socket.write_all(&resp_null()).await?;
                             }
                         }
+
+                        // Blocking pop with lease: returns [task_id, payload]
                         Command::BrpopLease {
                             queue,
                             timeout_secs,
@@ -240,6 +274,8 @@ pub async fn handle_connection(
                                 socket.write_all(&resp_null()).await?;
                             }
                         }
+
+                        // Renew task lease window (heartbeat)
                         Command::TaskTouch {
                             queue,
                             task_id,
@@ -253,6 +289,8 @@ pub async fn handle_connection(
                                 socket.write_all(&resp_error("Task ID not found in-flight")).await?;
                             }
                         }
+
+                        // Settle task successfully
                         Command::TaskAck { queue, task_id } => {
                             let success = ctx.engine.task_ack(&queue, &task_id);
                             if success {
@@ -263,6 +301,8 @@ pub async fn handle_connection(
                                     .await?;
                             }
                         }
+
+                        // Mark task as failed
                         Command::TaskNack { queue, task_id } => {
                             let success = ctx.engine.task_nack(&queue, &task_id);
                             if success {
@@ -273,6 +313,8 @@ pub async fn handle_connection(
                                     .await?;
                             }
                         }
+
+                        // Compact persistence ledger
                         Command::BgRewriteAof => {
                             let current_state = {
                                 let inner = ctx.engine.inner.read();
@@ -294,8 +336,9 @@ pub async fn handle_connection(
                                 }
                             }
                         }
+
+                        // Replica node real-time mutation stream subscriber
                         Command::Sync => {
-                            // Replica stream handler
                             let mut rx = ctx.replica_stream.subscribe();
                             socket.write_all(&resp_simple_string("SYNC OK")).await?;
                             loop {
@@ -313,9 +356,11 @@ pub async fn handle_connection(
                                 }
                             }
                         }
+
                         Command::ReplConf => {
                             socket.write_all(&resp_simple_string("OK")).await?;
                         }
+
                         Command::Unknown => {
                             socket
                                 .write_all(&resp_error("unknown command or syntax error"))
@@ -323,7 +368,7 @@ pub async fn handle_connection(
                         }
                     }
                 }
-                Ok(None) => break,
+                Ok(None) => break, // Partial frame received; loop to read more socket data
                 Err(_) => {
                     socket.write_all(&resp_error("protocol error")).await?;
                     return Err(std::io::Error::new(

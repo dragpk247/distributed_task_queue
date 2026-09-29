@@ -1,40 +1,64 @@
+//! # Queue Engine Module
+//!
+//! Implements high-throughput, low-latency concurrent task queues with:
+//! - Thread-safe state managed by `parking_lot::RwLock`.
+//! - True FIFO queue ordering via `VecDeque`.
+//! - At-least-once task leasing with visibility timeouts (`InFlightTask`).
+//! - Automatic Dead-Letter Queue (DLQ) routing upon exceeding maximum retries.
+//! - Non-busy event-driven notification channels (`tokio::sync::broadcast`) for async `BRPOP` workers.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
+/// Default visibility timeout granted to a worker when leasing a task without explicit duration.
 pub const DEFAULT_VISIBILITY_TIMEOUT_SECS: u64 = 30;
+
+/// Default maximum retry attempts before moving a poisoned/failing task to the Dead-Letter Queue.
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
 
+/// A discrete unit of work residing inside a FIFO queue.
 #[derive(Debug, Clone)]
 pub struct TaskItem {
+    /// Raw payload bytes of the task (e.g. JSON, Protobuf, binary).
     pub payload: Vec<u8>,
+    /// Number of times this task was leased and subsequently failed or timed out.
     pub retry_count: u32,
+    /// Threshold of retry attempts before permanent escalation to the DLQ.
     pub max_retries: u32,
 }
 
+/// An active task currently checked out/leased by an external worker thread.
 #[derive(Debug, Clone)]
 pub struct InFlightTask {
+    /// Unique identifier for this lease instance (e.g. "task-1").
     pub id: String,
+    /// Underlying task data and retry history.
     pub item: TaskItem,
+    /// Timestamp when this lease was granted or last renewed via `TASKTOUCH`.
     pub leased_at: Instant,
+    /// Max duration the worker has to ACK before the background reaper reclaims the task.
     pub visibility_timeout: Duration,
 }
 
+/// Internal shared mutable state protected by a read-write lock.
 #[derive(Default)]
 pub struct EngineInner {
-    /// queue_name -> FIFO tasks (ready for workers)
+    /// Mapping: `queue_name` -> FIFO deque of tasks awaiting workers.
     pub queues: HashMap<String, VecDeque<TaskItem>>,
-    /// queue_name -> in-flight tasks keyed by task ID
+    /// Mapping: `queue_name` -> (`task_id` -> active `InFlightTask`).
     pub in_flight: HashMap<String, HashMap<String, InFlightTask>>,
-    /// Dead letter queues: queue_name -> list of failed payloads
+    /// Mapping: `queue_name` -> list of permanently failed task payloads (DLQ).
     pub dead_letter_queues: HashMap<String, Vec<Vec<u8>>>,
 }
 
+/// The core concurrent queue engine.
 pub struct QueueEngine {
+    /// Thread-safe in-memory state wrapped in a low-overhead RwLock.
     pub inner: RwLock<EngineInner>,
-    /// Broadcast notifier to wake up any awaiting BRPOP / BRPOPLPUSH listeners
+    /// Broadcast notifier to wake up waiting `BRPOP` / `BRPOPLEASE` workers when new tasks arrive.
     notifier: broadcast::Sender<String>,
 }
 
@@ -45,6 +69,7 @@ impl Default for QueueEngine {
 }
 
 impl QueueEngine {
+    /// Creates a new, empty `QueueEngine` instance with an active notification channel.
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(1024);
         Self {
@@ -53,7 +78,10 @@ impl QueueEngine {
         }
     }
 
-    /// Push an element to the front/head of the queue (LPUSH)
+    /// Pushes an element to the head/front of the queue (`LPUSH`).
+    ///
+    /// Returns the new total length of the queue. Also broadcasts an event
+    /// to awaken any suspended async workers waiting on this queue.
     pub fn lpush(&self, queue: &str, payload: Vec<u8>) -> usize {
         let item = TaskItem {
             payload,
@@ -66,17 +94,20 @@ impl QueueEngine {
             q.push_front(item);
             q.len()
         };
+        // Wake up any workers awaiting work on this specific queue
         let _ = self.notifier.send(queue.to_string());
         len
     }
 
-    /// Pop an element from the tail of the queue (RPOP)
+    /// Pops an element from the tail of the queue (`RPOP`) without leasing.
+    ///
+    /// Preserves standard Redis FIFO semantics (LPUSH + RPOP = FIFO).
     pub fn rpop(&self, queue: &str) -> Option<Vec<u8>> {
         let mut lock = self.inner.write();
         lock.queues.get_mut(queue).and_then(|q| q.pop_back().map(|item| item.payload))
     }
 
-    /// Atomically pops from tail of source and prepends to head of destination (RPOPLPUSH)
+    /// Atomically pops from the tail of `source` and prepends to the head of `destination` (`RPOPLPUSH`).
     pub fn rpoplpush(&self, source: &str, destination: &str) -> Option<Vec<u8>> {
         let mut lock = self.inner.write();
         let item = lock.queues.get_mut(source).and_then(|q| q.pop_back())?;
@@ -87,7 +118,11 @@ impl QueueEngine {
         Some(payload)
     }
 
-    /// Leased pop: Pops task and tracks it in `in_flight` under visibility timeout
+    /// Leased Pop: Pops the next task from the tail and tracks it under `in_flight`
+    /// with an active visibility timeout.
+    ///
+    /// If the worker fails to ACK or crashes, the background lease reaper will
+    /// reclaim the task after `visibility_timeout` expires.
     pub fn rpop_with_lease(
         &self,
         queue: &str,
@@ -113,47 +148,9 @@ impl QueueEngine {
         Some(payload)
     }
 
-    /// Acknowledge successful processing of an in-flight task (TASKACK)
-    pub fn task_ack(&self, queue: &str, task_id: &str) -> bool {
-        let mut lock = self.inner.write();
-        if let Some(queue_tasks) = lock.in_flight.get_mut(queue) {
-            queue_tasks.remove(task_id).is_some()
-        } else {
-            false
-        }
-    }
-
-    /// Negative-acknowledge: fail task immediately and trigger retry or DLQ (TASKNACK)
-    pub fn task_nack(&self, queue: &str, task_id: &str) -> bool {
-        let mut lock = self.inner.write();
-        let task_opt = lock
-            .in_flight
-            .get_mut(queue)
-            .and_then(|queue_tasks| queue_tasks.remove(task_id));
-
-        if let Some(mut in_flight) = task_opt {
-            in_flight.item.retry_count += 1;
-            if in_flight.item.retry_count >= in_flight.item.max_retries {
-                // Route to Dead Letter Queue
-                lock.dead_letter_queues
-                    .entry(queue.to_string())
-                    .or_default()
-                    .push(in_flight.item.payload);
-            } else {
-                // Re-queue to tail (or front)
-                lock.queues
-                    .entry(queue.to_string())
-                    .or_default()
-                    .push_back(in_flight.item);
-                let _ = self.notifier.send(queue.to_string());
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Extend lease visibility timeout for long running tasks (TASKTOUCH)
+    /// Renews or extends an active lease visibility timeout (`TASKTOUCH`).
+    ///
+    /// Used by long-running workers to prevent the background reaper from reclaiming tasks in progress.
     pub fn task_touch(&self, queue: &str, task_id: &str, extend_by: Duration) -> bool {
         let mut lock = self.inner.write();
         if let Some(queue_tasks) = lock.in_flight.get_mut(queue) {
@@ -166,7 +163,77 @@ impl QueueEngine {
         false
     }
 
-    /// Asynchronous blocking pop with lease
+    /// Acknowledges successful processing of an in-flight task (`TASKACK`).
+    ///
+    /// Permanently removes the task from the system. Returns `true` if found and deleted.
+    pub fn task_ack(&self, queue: &str, task_id: &str) -> bool {
+        let mut lock = self.inner.write();
+        if let Some(queue_tasks) = lock.in_flight.get_mut(queue) {
+            queue_tasks.remove(task_id).is_some()
+        } else {
+            false
+        }
+    }
+
+    /// Negatively acknowledges a task (`TASKNACK`).
+    ///
+    /// Increments the task retry count. If it exceeds `max_retries`, routes the payload
+    /// directly to the Dead-Letter Queue. Otherwise, puts it back into the ready queue.
+    pub fn task_nack(&self, queue: &str, task_id: &str) -> bool {
+        let mut lock = self.inner.write();
+        let task_opt = lock
+            .in_flight
+            .get_mut(queue)
+            .and_then(|queue_tasks| queue_tasks.remove(task_id));
+
+        if let Some(mut in_flight) = task_opt {
+            in_flight.item.retry_count += 1;
+            if in_flight.item.retry_count >= in_flight.item.max_retries {
+                // Maximum retries exceeded: Route to Dead Letter Queue
+                lock.dead_letter_queues
+                    .entry(queue.to_string())
+                    .or_default()
+                    .push(in_flight.item.payload);
+            } else {
+                // Re-queue to back of FIFO deque for next available worker
+                lock.queues
+                    .entry(queue.to_string())
+                    .or_default()
+                    .push_back(in_flight.item);
+                let _ = self.notifier.send(queue.to_string());
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Asynchronous blocking pop on one or more queues with timeout (`BRPOP`).
+    ///
+    /// Suspends asynchronously using Tokio broadcast events without busy-spinning CPU cycles.
+    pub async fn brpop(
+        self: &Arc<Self>,
+        queues: &[String],
+        timeout: Duration,
+    ) -> Option<(String, Vec<u8>)> {
+        // Fast-path: check if any queue already has items ready
+        for q in queues {
+            if let Some(payload) = self.rpop(q) {
+                return Some((q.clone(), payload));
+            }
+        }
+
+        if timeout.is_zero() {
+            return self.wait_for_any_queue(queues).await;
+        }
+
+        tokio::select! {
+            result = self.wait_for_any_queue(queues) => result,
+            _ = tokio::time::sleep(timeout) => None,
+        }
+    }
+
+    /// Asynchronous blocking pop with atomic lease creation (`BRPOPLEASE`).
     pub async fn brpop_lease(
         self: &Arc<Self>,
         queue: &str,
@@ -174,12 +241,12 @@ impl QueueEngine {
         visibility_timeout: Duration,
         task_id: String,
     ) -> Option<Vec<u8>> {
-        // Fast-path: check if queue already has items
+        // Fast-path check
         if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
             return Some(payload);
         }
 
-        if timeout.is_zero() {
+        let wait_future = async {
             let mut rx = self.notifier.subscribe();
             loop {
                 if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
@@ -200,55 +267,15 @@ impl QueueEngine {
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }
-        }
-
-        tokio::select! {
-            result = async {
-                let mut rx = self.notifier.subscribe();
-                loop {
-                    if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
-                        return Some(payload);
-                    }
-                    match rx.recv().await {
-                        Ok(q_name) if q_name == queue => {
-                            if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
-                                return Some(payload);
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
-                                return Some(payload);
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return None,
-                    }
-                }
-            } => result,
-            _ = tokio::time::sleep(timeout) => None,
-        }
-    }
-
-    /// Asynchronous blocking pop on one or more queues with timeout (BRPOP)
-    pub async fn brpop(
-        self: &Arc<Self>,
-        queues: &[String],
-        timeout: Duration,
-    ) -> Option<(String, Vec<u8>)> {
-        // Fast-path: check if any queue already has items
-        for q in queues {
-            if let Some(payload) = self.rpop(q) {
-                return Some((q.clone(), payload));
-            }
-        }
+        };
 
         if timeout.is_zero() {
-            return self.wait_for_any_queue(queues).await;
-        }
-
-        tokio::select! {
-            result = self.wait_for_any_queue(queues) => result,
-            _ = tokio::time::sleep(timeout) => None,
+            wait_future.await
+        } else {
+            tokio::select! {
+                res = wait_future => res,
+                _ = tokio::time::sleep(timeout) => None,
+            }
         }
     }
 
@@ -282,12 +309,17 @@ impl QueueEngine {
         }
     }
 
-    /// Background reaper to reclaim tasks whose visibility timeouts have expired
+    /// Background reaper scanning in-flight tasks and reclaiming any whose visibility timeout expired.
+    ///
+    /// If an expired task has hit `max_retries`, it routes directly to the DLQ.
+    /// Otherwise, it re-queues to `queues` and broadcasts an event to wake up idle workers.
+    /// Returns the total number of reaped tasks.
     pub fn reap_expired_leases(&self) -> usize {
         let mut reaped = 0;
         let now = Instant::now();
         let mut expired_tasks: Vec<(String, InFlightTask)> = Vec::new();
 
+        // Pass 1: Extract expired task IDs without holding write locks on the whole state
         {
             let mut lock = self.inner.write();
             for (q, tasks) in lock.in_flight.iter_mut() {
@@ -309,6 +341,7 @@ impl QueueEngine {
             return 0;
         }
 
+        // Pass 2: Re-queue or route to DLQ
         let mut lock = self.inner.write();
         for (q, mut task) in expired_tasks {
             reaped += 1;
@@ -369,7 +402,6 @@ mod tests {
                 .await
         });
 
-        // Small delay, then push
         tokio::time::sleep(Duration::from_millis(50)).await;
         engine.lpush("async_queue", b"async_payload".to_vec());
 

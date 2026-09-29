@@ -1,73 +1,105 @@
+//! # Protocol Module: RESP Wire Protocol Parser & Serializers
+//!
+//! Provides zero-copy parsing of the Redis Serialization Protocol (RESP) wire format
+//! into structured Rust [`Command`] variants, along with helper response serializers.
+
 use bytes::{Buf, BytesMut};
 use std::io::{Error, ErrorKind};
 
+/// Supported client-to-server commands.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Command {
+    /// Health-check probe (`PING`). Responds with `+PONG\r\n`.
     Ping,
+
+    /// Push an item to the head of the queue (`LPUSH <queue> <payload>`).
     Lpush {
         queue: String,
         payload: Vec<u8>,
     },
+
+    /// Non-blocking pop from the tail of the queue (`RPOP <queue>`).
     Rpop {
         queue: String,
     },
+
+    /// Atomically pops from the tail of source queue and prepends to destination queue (`RPOPLPUSH <source> <destination>`).
     Rpoplpush {
         source: String,
         destination: String,
     },
-    /// BRPOP queue [queue ...] timeout_seconds
+
+    /// Non-busy blocking pop across one or more queues (`BRPOP <queue...> <timeout_secs>`).
     Brpop {
         queues: Vec<String>,
         timeout_secs: f64,
     },
-    /// BRPOPLPUSH source destination timeout_seconds
+
+    /// Blocking pop from source and push to destination (`BRPOPLPUSH <source> <destination> <timeout_secs>`).
     Brpoplpush {
         source: String,
         destination: String,
         timeout_secs: f64,
     },
-    /// RPOPLEASE queue [visibility_timeout_secs]
+
+    /// Pop and lease a task with a visibility timeout window (`RPOPLEASE <queue> [visibility_secs]`).
+    /// Returns `[task_id, payload]`.
     RpopLease {
         queue: String,
         visibility_secs: f64,
     },
-    /// BRPOPLEASE queue timeout_seconds [visibility_timeout_secs]
+
+    /// Blocking pop and lease with timeout (`BRPOPLEASE <queue> <timeout_secs> [visibility_secs]`).
     BrpopLease {
         queue: String,
         timeout_secs: f64,
         visibility_secs: f64,
     },
-    /// TASKTOUCH queue task_id [extend_secs]
+
+    /// Heartbeat command to extend an active task lease (`TASKTOUCH <queue> <task_id> [extend_secs]`).
     TaskTouch {
         queue: String,
         task_id: String,
         extend_secs: f64,
     },
-    /// TASKACK queue task_id
+
+    /// Acknowledge successful completion of a leased task (`TASKACK <queue> <task_id>`).
     TaskAck {
         queue: String,
         task_id: String,
     },
-    /// TASKNACK queue task_id
+
+    /// Negative-acknowledge a failed task, incrementing retries or escalating to DLQ (`TASKNACK <queue> <task_id>`).
     TaskNack {
         queue: String,
         task_id: String,
     },
-    /// Trigger background or inline AOF compaction
+
+    /// Triggers online compaction of the Append-Only File (`BGREWRITEAOF`).
     BgRewriteAof,
-    /// Connect as replica node streaming mutation log
+
+    /// Replication handshake negotiation (`REPLCONF`).
     ReplConf,
+
+    /// Subscribes replica nodes to the live binary mutation stream (`SYNC`).
     Sync,
+
+    /// Fallback for unrecognized commands or malformed argument counts.
     Unknown,
 }
 
-/// Parses a raw binary buffer to extract a valid, complete RESP command frame
+/// Parses a raw binary stream buffer to extract a valid, complete RESP command frame.
+///
+/// Returns:
+/// - `Ok(Some((Command, Vec<u8>)))` if a complete frame was parsed, along with the raw bytes.
+/// - `Ok(None)` if the buffer currently contains an incomplete frame (caller should read more bytes from TCP socket).
+/// - `Err(Error)` if the frame violates the RESP protocol structure.
 pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>, Error> {
     if buffer.is_empty() {
         return Ok(None);
     }
 
-    // Inspect the first byte to verify it's a RESP Array container
+    // Step 1: Inspect the first byte to verify it's a RESP Array container ('*')
     if buffer[0] != b'*' {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -75,12 +107,12 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
         ));
     }
 
-    // Find the end of the array length indicator line (\r\n)
+    // Step 2: Locate the trailing CRLF for the array element count
     let Some(line_end) = buffer.windows(2).position(|w| w == b"\r\n") else {
         return Ok(None); // Incomplete frame line, wait for more data from the socket
     };
 
-    // Parse how many arguments are contained in this command array
+    // Step 3: Parse how many arguments are contained in this command array
     let len_str = std::str::from_utf8(&buffer[1..line_end])
         .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF-8 sequence in array length"))?;
 
@@ -88,16 +120,16 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
         .parse()
         .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid integer string for array length"))?;
 
-    // Keep track of our parsing cursor offset within the buffer
+    // Step 4: Iteratively extract each individual Bulk String ($) from the array container
     let mut cursor = line_end + 2;
     let mut args: Vec<Vec<u8>> = Vec::with_capacity(num_elements);
 
-    // Iteratively extract each individual Bulk String ($) from the array container
     for _ in 0..num_elements {
         if cursor >= buffer.len() {
             return Ok(None); // Incomplete stream, wait for next socket chunk
         }
 
+        // Verify bulk string marker '$'
         if buffer[cursor] != b'$' {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -138,13 +170,13 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
         cursor = string_data_end + 2;
     }
 
-    // Extract the raw command frame bytes before advancing buffer
+    // Step 5: Save raw frame bytes for persistence & replication before advancing the buffer
     let raw_frame = buffer[..cursor].to_vec();
 
-    // Safely advance the buffer to drop the processed command bytes from memory
+    // Advance buffer cursor to discard processed command bytes from memory
     buffer.advance(cursor);
 
-    // Map extracted bulk string payloads to concrete Rust structured variants
+    // Step 6: Map extracted bulk string payloads to strongly-typed Command variants
     if args.is_empty() {
         return Ok(Some((Command::Unknown, raw_frame)));
     }
@@ -248,15 +280,17 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
     Ok(Some((cmd, raw_frame)))
 }
 
-/// Helper functions to format RESP responses
+/// Serializes a RESP Simple String (`+<msg>\r\n`)
 pub fn resp_simple_string(msg: &str) -> Vec<u8> {
     format!("+{}\r\n", msg).into_bytes()
 }
 
+/// Serializes a RESP Error (`-ERR <msg>\r\n`)
 pub fn resp_error(msg: &str) -> Vec<u8> {
     format!("-ERR {}\r\n", msg).into_bytes()
 }
 
+/// Serializes a RESP Bulk String (`$<len>\r\n<data>\r\n`)
 pub fn resp_bulk_string(data: &[u8]) -> Vec<u8> {
     let mut resp = format!("${}\r\n", data.len()).into_bytes();
     resp.extend_from_slice(data);
@@ -264,14 +298,17 @@ pub fn resp_bulk_string(data: &[u8]) -> Vec<u8> {
     resp
 }
 
+/// Serializes a RESP Null Bulk String (`$-1\r\n`) representing a nil/empty pop
 pub fn resp_null() -> Vec<u8> {
     b"$-1\r\n".to_vec()
 }
 
+/// Serializes a RESP Integer (`:<val>\r\n`)
 pub fn resp_integer(val: i64) -> Vec<u8> {
     format!(":{}\r\n", val).into_bytes()
 }
 
+/// Serializes a RESP Array of nested serialized elements (`*<count>\r\n...`)
 pub fn resp_array(elements: &[Vec<u8>]) -> Vec<u8> {
     let mut resp = format!("*{}\r\n", elements.len()).into_bytes();
     for el in elements {

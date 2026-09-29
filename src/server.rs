@@ -7,13 +7,13 @@
 //! - Broadcasts mutations live to connected replicas over [`broadcast::Sender`].
 //! - Runs an autonomous background timer thread to reclaim expired visibility task leases.
 
+use bytes::{Buf, BytesMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
-use bytes::{Buf, BytesMut};
 
 use crate::aof::AofManager;
 use crate::engine::QueueEngine;
@@ -177,14 +177,16 @@ pub async fn handle_connection(
                         } else if ctx.requirepass.is_none() {
                             // Client attempted AUTH on a server without password configured
                             socket
-                                .write_all(&resp_error("ERR Client sent AUTH, but no password is set"))
+                                .write_all(&resp_error(
+                                    "ERR Client sent AUTH, but no password is set",
+                                ))
                                 .await?;
                         } else {
                             // Invalid password provided
                             socket
                                 .write_all(&resp_error(
                                     "WRONGPASS invalid username-password pair or token",
-                                 ))
+                                ))
                                 .await?;
                         }
                         continue;
@@ -228,7 +230,10 @@ pub async fn handle_connection(
                         }
 
                         // Atomic transfer between queues
-                        Command::Rpoplpush { source, destination } => {
+                        Command::Rpoplpush {
+                            source,
+                            destination,
+                        } => {
                             let maybe_item = ctx.engine.rpoplpush(&source, &destination);
                             if let Some(item) = maybe_item {
                                 let _ = ctx.aof.append(&raw_frame);
@@ -273,7 +278,10 @@ pub async fn handle_connection(
                             timeout_secs,
                         } => {
                             let timeout = Duration::from_secs_f64(timeout_secs);
-                            let rx = ctx.engine.brpop(std::slice::from_ref(&source), timeout).await;
+                            let rx = ctx
+                                .engine
+                                .brpop(std::slice::from_ref(&source), timeout)
+                                .await;
                             if let Some((_, item)) = rx {
                                 ctx.engine.lpush(&destination, item.clone());
                                 let rpoplpush_frame = format!(
@@ -301,12 +309,16 @@ pub async fn handle_connection(
                             let task_id = format!("task-{}", task_num);
                             let vis_duration = Duration::from_secs_f64(visibility_secs);
 
-                            if let Some(payload) = ctx.engine.rpop_with_lease(&queue, task_id.clone(), vis_duration) {
+                            if let Some(payload) =
+                                ctx.engine
+                                    .rpop_with_lease(&queue, task_id.clone(), vis_duration)
+                            {
                                 let rpop_frame = format!(
                                     "*2\r\n$4\r\nRPOP\r\n${}\r\n{}\r\n",
                                     queue.len(),
                                     queue
-                                ).into_bytes();
+                                )
+                                .into_bytes();
                                 let _ = ctx.aof.append(&rpop_frame);
                                 let _ = ctx.replica_stream.send(rpop_frame);
 
@@ -331,12 +343,17 @@ pub async fn handle_connection(
                             let timeout = Duration::from_secs_f64(timeout_secs);
                             let vis_duration = Duration::from_secs_f64(visibility_secs);
 
-                            if let Some(payload) = ctx.engine.brpop_lease(&queue, timeout, vis_duration, task_id.clone()).await {
+                            if let Some(payload) = ctx
+                                .engine
+                                .brpop_lease(&queue, timeout, vis_duration, task_id.clone())
+                                .await
+                            {
                                 let rpop_frame = format!(
                                     "*2\r\n$4\r\nRPOP\r\n${}\r\n{}\r\n",
                                     queue.len(),
                                     queue
-                                ).into_bytes();
+                                )
+                                .into_bytes();
                                 let _ = ctx.aof.append(&rpop_frame);
                                 let _ = ctx.replica_stream.send(rpop_frame);
 
@@ -361,7 +378,9 @@ pub async fn handle_connection(
                             if success {
                                 socket.write_all(&resp_simple_string("OK")).await?;
                             } else {
-                                socket.write_all(&resp_error("Task ID not found in-flight")).await?;
+                                socket
+                                    .write_all(&resp_error("Task ID not found in-flight"))
+                                    .await?;
                             }
                         }
 
@@ -406,7 +425,10 @@ pub async fn handle_connection(
                                 }
                                 Err(e) => {
                                     socket
-                                        .write_all(&resp_error(&format!("AOF rewrite failed: {}", e)))
+                                        .write_all(&resp_error(&format!(
+                                            "AOF rewrite failed: {}",
+                                            e
+                                        )))
                                         .await?;
                                 }
                             }
@@ -445,7 +467,8 @@ pub async fn handle_connection(
                             // Convert floating point seconds into std::time::Duration (clamp negative to 0)
                             let duration = Duration::from_secs_f64(delay_secs.max(0.0));
                             // Enqueue task into Engine's min-heap and receive unique assigned task ID
-                            let task_id = ctx.engine.lpush_delayed(&queue, duration, payload.clone());
+                            let task_id =
+                                ctx.engine.lpush_delayed(&queue, duration, payload.clone());
                             // Persist delayed task schedule to AOF log and mirror to connected replicas
                             let _ = ctx.aof.append(&raw_frame);
                             let _ = ctx.replica_stream.send(raw_frame);
@@ -480,23 +503,42 @@ pub async fn handle_connection(
 
 /// Runs replica follower synchronization loop (alias for [`start_replica_follower`]).
 pub async fn run_replica_sync(primary_addr: String, engine: Arc<QueueEngine>) {
-    start_replica_follower(primary_addr, engine).await;
+    start_replica_follower(primary_addr, engine, None).await;
 }
 
 /// Connects to a primary server node and replicates mutation commands (`SYNC`).
 ///
-/// Connects to `primary_addr`, transmits `*1\r\n$4\r\nSYNC\r\n`, and consumes incoming
-/// RESP mutation frames (`LPUSH`, `RPOP`, `RPOPLPUSH`, `LPUSHDELAY`), applying each
-/// directly to the local [`QueueEngine`]. If the connection fails or drops, automatically
-/// reconnects starting after 2 seconds with exponential backoff.
-pub async fn start_replica_follower(primary_addr: String, engine: Arc<QueueEngine>) {
+/// Connects to `primary_addr`, transmits `AUTH` (if `master_auth` is configured),
+/// transmits `*1\r\n$4\r\nSYNC\r\n`, and consumes incoming RESP mutation frames
+/// (`LPUSH`, `RPOP`, `RPOPLPUSH`, `LPUSHDELAY`), applying each directly to the local
+/// [`QueueEngine`]. If the connection fails or drops, automatically reconnects starting
+/// after 2 seconds with exponential backoff.
+pub async fn start_replica_follower(
+    primary_addr: String,
+    engine: Arc<QueueEngine>,
+    master_auth: Option<String>,
+) {
     let mut retry_delay = Duration::from_secs(2);
     let max_retry_delay = Duration::from_secs(32);
 
     loop {
-        tracing::info!("Connecting to primary replication master at {}", primary_addr);
+        tracing::info!(
+            "Connecting to primary replication master at {}",
+            primary_addr
+        );
         match TcpStream::connect(&primary_addr).await {
             Ok(mut stream) => {
+                // If the primary master requires authentication, send AUTH first
+                if let Some(ref pass) = master_auth {
+                    let auth_frame = format!("*2\r\n$4\r\nAUTH\r\n${}\r\n{}\r\n", pass.len(), pass);
+                    if let Err(e) = stream.write_all(auth_frame.as_bytes()).await {
+                        tracing::warn!("Failed to send AUTH to primary: {:?}", e);
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+                        continue;
+                    }
+                }
+
                 tracing::info!("Connected to primary {}. Sending SYNC...", primary_addr);
                 if let Err(e) = stream.write_all(b"*1\r\n$4\r\nSYNC\r\n").await {
                     tracing::warn!("Failed to send SYNC command to primary: {:?}", e);
@@ -548,7 +590,8 @@ pub async fn start_replica_follower(primary_addr: String, engine: Arc<QueueEngin
                                             delay_secs,
                                             payload,
                                         } => {
-                                            let duration = Duration::from_secs_f64(delay_secs.max(0.0));
+                                            let duration =
+                                                Duration::from_secs_f64(delay_secs.max(0.0));
                                             engine.lpush_delayed(&queue, duration, payload);
                                         }
                                         _ => {

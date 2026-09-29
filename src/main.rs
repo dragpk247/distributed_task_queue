@@ -22,6 +22,10 @@ struct Args {
     #[arg(long)]
     replicaof: Option<String>,
 
+    /// Optional password authentication for authenticating with the primary master node
+    #[arg(long)]
+    masterauth: Option<String>,
+
     /// Optional password authentication requirement (`AUTH <password>`)
     #[arg(long)]
     requirepass: Option<String>,
@@ -42,9 +46,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. If --replicaof is specified, spawn the follower replication background worker
     if let Some(primary_addr) = args.replicaof {
         let engine = server.get_engine();
-        tracing::info!("Starting replica follower connecting to primary {}", primary_addr);
+        let master_auth = args.masterauth;
+        tracing::info!(
+            "Starting replica follower connecting to primary {}",
+            primary_addr
+        );
         tokio::spawn(async move {
-            server::start_replica_follower(primary_addr, engine).await;
+            server::start_replica_follower(primary_addr, engine, master_auth).await;
         });
     }
 

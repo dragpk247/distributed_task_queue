@@ -6,13 +6,13 @@
 //! - Online AOF compaction (`BGREWRITEAOF`): writes clean, minimal state to a temporary file
 //!   and atomically swaps files via OS `rename` to prevent disk bloat.
 
+use bytes::BytesMut;
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use bytes::BytesMut;
-use parking_lot::Mutex;
 
 use crate::engine::{TaskItem, DEFAULT_MAX_RETRIES};
 use crate::protocol::{parse_command, Command};
@@ -63,7 +63,9 @@ impl AofManager {
     pub fn replay(&self) -> std::io::Result<HashMap<String, VecDeque<TaskItem>>> {
         let mut queues: HashMap<String, VecDeque<TaskItem>> = HashMap::new();
         let file = OpenOptions::new().read(true).open(&self.file_path);
-        let Ok(f) = file else { return Ok(queues); };
+        let Ok(f) = file else {
+            return Ok(queues);
+        };
 
         let mut reader = BufReader::new(f);
         let mut file_bytes = Vec::new();
@@ -91,7 +93,10 @@ impl AofManager {
                         }
                         count += 1;
                     }
-                    Command::Rpoplpush { source, destination } => {
+                    Command::Rpoplpush {
+                        source,
+                        destination,
+                    } => {
                         if let Some(item) = queues.get_mut(&source).and_then(|q| q.pop_back()) {
                             queues.entry(destination).or_default().push_front(item);
                         }
@@ -116,7 +121,10 @@ impl AofManager {
     ///
     /// This removes historical dead commands (e.g. pushed items that were subsequently popped),
     /// bounding disk space usage.
-    pub fn compact(&self, current_state: &HashMap<String, VecDeque<TaskItem>>) -> std::io::Result<usize> {
+    pub fn compact(
+        &self,
+        current_state: &HashMap<String, VecDeque<TaskItem>>,
+    ) -> std::io::Result<usize> {
         let temp_path = self.file_path.with_extension("aof.tmp");
         let mut temp_file = OpenOptions::new()
             .create(true)
@@ -156,7 +164,10 @@ impl AofManager {
             .append(true)
             .open(&self.file_path)?;
 
-        tracing::info!("AOF Compaction complete: wrote {} items cleanly.", written_commands);
+        tracing::info!(
+            "AOF Compaction complete: wrote {} items cleanly.",
+            written_commands
+        );
         Ok(written_commands)
     }
 }

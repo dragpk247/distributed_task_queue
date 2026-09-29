@@ -7,10 +7,10 @@
 //! - Automatic Dead-Letter Queue (DLQ) routing upon exceeding maximum retries.
 //! - Non-busy event-driven notification channels (`tokio::sync::broadcast`) for async `BRPOP` workers.
 
+use parking_lot::RwLock;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 /// Default visibility timeout granted to a worker when leasing a task without explicit duration.
@@ -150,7 +150,9 @@ impl QueueEngine {
     /// Preserves standard Redis FIFO semantics (LPUSH + RPOP = FIFO).
     pub fn rpop(&self, queue: &str) -> Option<Vec<u8>> {
         let mut lock = self.inner.write();
-        lock.queues.get_mut(queue).and_then(|q| q.pop_back().map(|item| item.payload))
+        lock.queues
+            .get_mut(queue)
+            .and_then(|q| q.pop_back().map(|item| item.payload))
     }
 
     /// Atomically pops from the tail of `source` and prepends to the head of `destination` (`RPOPLPUSH`).
@@ -295,18 +297,24 @@ impl QueueEngine {
         let wait_future = async {
             let mut rx = self.notifier.subscribe();
             loop {
-                if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+                if let Some(payload) =
+                    self.rpop_with_lease(queue, task_id.clone(), visibility_timeout)
+                {
                     return Some(payload);
                 }
                 match rx.recv().await {
                     Ok(q_name) if q_name == queue => {
-                        if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+                        if let Some(payload) =
+                            self.rpop_with_lease(queue, task_id.clone(), visibility_timeout)
+                        {
                             return Some(payload);
                         }
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+                        if let Some(payload) =
+                            self.rpop_with_lease(queue, task_id.clone(), visibility_timeout)
+                        {
                             return Some(payload);
                         }
                     }
@@ -513,7 +521,10 @@ mod tests {
         engine.lpush("async_queue", b"async_payload".to_vec());
 
         let result = handle.await.unwrap();
-        assert_eq!(result, Some(("async_queue".to_string(), b"async_payload".to_vec())));
+        assert_eq!(
+            result,
+            Some(("async_queue".to_string(), b"async_payload".to_vec()))
+        );
     }
 
     #[test]
@@ -585,7 +596,11 @@ mod tests {
         let engine_clone = Arc::clone(&engine);
 
         // Schedule delayed task with 50ms delay
-        engine.lpush_delayed("delayed_q", Duration::from_millis(50), b"delayed_item".to_vec());
+        engine.lpush_delayed(
+            "delayed_q",
+            Duration::from_millis(50),
+            b"delayed_item".to_vec(),
+        );
 
         // Worker waiting with BRPOP
         let handle = tokio::spawn(async move {
@@ -600,6 +615,9 @@ mod tests {
         assert_eq!(promoted.len(), 1);
 
         let result = handle.await.unwrap();
-        assert_eq!(result, Some(("delayed_q".to_string(), b"delayed_item".to_vec())));
+        assert_eq!(
+            result,
+            Some(("delayed_q".to_string(), b"delayed_item".to_vec()))
+        );
     }
 }

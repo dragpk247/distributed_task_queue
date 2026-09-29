@@ -13,21 +13,13 @@ pub enum Command {
     Ping,
 
     /// Push an item to the head of the queue (`LPUSH <queue> <payload>`).
-    Lpush {
-        queue: String,
-        payload: Vec<u8>,
-    },
+    Lpush { queue: String, payload: Vec<u8> },
 
     /// Non-blocking pop from the tail of the queue (`RPOP <queue>`).
-    Rpop {
-        queue: String,
-    },
+    Rpop { queue: String },
 
     /// Atomically pops from the tail of source queue and prepends to destination queue (`RPOPLPUSH <source> <destination>`).
-    Rpoplpush {
-        source: String,
-        destination: String,
-    },
+    Rpoplpush { source: String, destination: String },
 
     /// Non-busy blocking pop across one or more queues (`BRPOP <queue...> <timeout_secs>`).
     Brpop {
@@ -44,10 +36,7 @@ pub enum Command {
 
     /// Pop and lease a task with a visibility timeout window (`RPOPLEASE <queue> [visibility_secs]`).
     /// Returns `[task_id, payload]`.
-    RpopLease {
-        queue: String,
-        visibility_secs: f64,
-    },
+    RpopLease { queue: String, visibility_secs: f64 },
 
     /// Blocking pop and lease with timeout (`BRPOPLEASE <queue> <timeout_secs> [visibility_secs]`).
     BrpopLease {
@@ -64,16 +53,10 @@ pub enum Command {
     },
 
     /// Acknowledge successful completion of a leased task (`TASKACK <queue> <task_id>`).
-    TaskAck {
-        queue: String,
-        task_id: String,
-    },
+    TaskAck { queue: String, task_id: String },
 
     /// Negative-acknowledge a failed task, incrementing retries or escalating to DLQ (`TASKNACK <queue> <task_id>`).
-    TaskNack {
-        queue: String,
-        task_id: String,
-    },
+    TaskNack { queue: String, task_id: String },
 
     /// Triggers online compaction of the Append-Only File (`BGREWRITEAOF`).
     BgRewriteAof,
@@ -92,9 +75,7 @@ pub enum Command {
     },
 
     /// Authenticate client connection (`AUTH <password>`).
-    Auth {
-        password: String,
-    },
+    Auth { password: String },
 
     /// Fallback for unrecognized commands or malformed argument counts.
     Unknown,
@@ -125,12 +106,19 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
     };
 
     // Step 3: Parse how many arguments are contained in this command array
-    let len_str = std::str::from_utf8(&buffer[1..line_end])
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF-8 sequence in array length"))?;
+    let len_str = std::str::from_utf8(&buffer[1..line_end]).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "Invalid UTF-8 sequence in array length",
+        )
+    })?;
 
-    let num_elements: usize = len_str
-        .parse()
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid integer string for array length"))?;
+    let num_elements: usize = len_str.parse().map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "Invalid integer string for array length",
+        )
+    })?;
 
     // Step 4: Iteratively extract each individual Bulk String ($) from the array container
     let mut cursor = line_end + 2;
@@ -155,10 +143,18 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
         let absolute_str_len_end = cursor + str_len_end;
 
         let str_len_str = std::str::from_utf8(&buffer[(cursor + 1)..absolute_str_len_end])
-            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF-8 in bulk string length"))?;
-        let str_len: usize = str_len_str
-            .parse()
-            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid integer for bulk string length"))?;
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid UTF-8 in bulk string length",
+                )
+            })?;
+        let str_len: usize = str_len_str.parse().map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "Invalid integer for bulk string length",
+            )
+        })?;
 
         let string_data_start = absolute_str_len_end + 2;
         let string_data_end = string_data_start + str_len;
@@ -208,7 +204,10 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
         "RPOPLPUSH" if args.len() == 3 => {
             let source = String::from_utf8_lossy(&args[1]).into_owned();
             let destination = String::from_utf8_lossy(&args[2]).into_owned();
-            Command::Rpoplpush { source, destination }
+            Command::Rpoplpush {
+                source,
+                destination,
+            }
         }
         "BRPOP" if args.len() >= 3 => {
             let timeout_str = String::from_utf8_lossy(&args[args.len() - 1]);
@@ -236,7 +235,9 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
         "RPOPLEASE" if args.len() >= 2 => {
             let queue = String::from_utf8_lossy(&args[1]).into_owned();
             let visibility_secs = if args.len() >= 3 {
-                String::from_utf8_lossy(&args[2]).parse::<f64>().unwrap_or(30.0)
+                String::from_utf8_lossy(&args[2])
+                    .parse::<f64>()
+                    .unwrap_or(30.0)
             } else {
                 30.0
             };
@@ -247,9 +248,13 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
         }
         "BRPOPLEASE" if args.len() >= 3 => {
             let queue = String::from_utf8_lossy(&args[1]).into_owned();
-            let timeout_secs = String::from_utf8_lossy(&args[2]).parse::<f64>().unwrap_or(0.0);
+            let timeout_secs = String::from_utf8_lossy(&args[2])
+                .parse::<f64>()
+                .unwrap_or(0.0);
             let visibility_secs = if args.len() >= 4 {
-                String::from_utf8_lossy(&args[3]).parse::<f64>().unwrap_or(30.0)
+                String::from_utf8_lossy(&args[3])
+                    .parse::<f64>()
+                    .unwrap_or(30.0)
             } else {
                 30.0
             };
@@ -263,7 +268,9 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
             let queue = String::from_utf8_lossy(&args[1]).into_owned();
             let task_id = String::from_utf8_lossy(&args[2]).into_owned();
             let extend_secs = if args.len() >= 4 {
-                String::from_utf8_lossy(&args[3]).parse::<f64>().unwrap_or(30.0)
+                String::from_utf8_lossy(&args[3])
+                    .parse::<f64>()
+                    .unwrap_or(30.0)
             } else {
                 30.0
             };
@@ -458,7 +465,8 @@ mod tests {
             }
         );
 
-        let mut buf2 = BytesMut::from("*4\r\n$10\r\nBRPOPLEASE\r\n$5\r\ntasks\r\n$1\r\n5\r\n$2\r\n60\r\n");
+        let mut buf2 =
+            BytesMut::from("*4\r\n$10\r\nBRPOPLEASE\r\n$5\r\ntasks\r\n$1\r\n5\r\n$2\r\n60\r\n");
         let (cmd2, _) = parse_command(&mut buf2).unwrap().unwrap();
         assert_eq!(
             cmd2,
@@ -469,7 +477,8 @@ mod tests {
             }
         );
 
-        let mut buf3 = BytesMut::from("*4\r\n$9\r\nTASKTOUCH\r\n$5\r\ntasks\r\n$6\r\njob-99\r\n$2\r\n15\r\n");
+        let mut buf3 =
+            BytesMut::from("*4\r\n$9\r\nTASKTOUCH\r\n$5\r\ntasks\r\n$6\r\njob-99\r\n$2\r\n15\r\n");
         let (cmd3, _) = parse_command(&mut buf3).unwrap().unwrap();
         assert_eq!(
             cmd3,
@@ -483,7 +492,9 @@ mod tests {
 
     #[test]
     fn test_parse_lpush_delay() {
-        let mut buf = BytesMut::from("*4\r\n$11\r\nLPUSH_DELAY\r\n$5\r\ntasks\r\n$3\r\n2.5\r\n$11\r\nhello world\r\n");
+        let mut buf = BytesMut::from(
+            "*4\r\n$11\r\nLPUSH_DELAY\r\n$5\r\ntasks\r\n$3\r\n2.5\r\n$11\r\nhello world\r\n",
+        );
         let (cmd, _) = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(
             cmd,
@@ -496,7 +507,9 @@ mod tests {
         assert!(buf.is_empty());
 
         // Invalid delay format should map to Unknown
-        let mut buf_err = BytesMut::from("*4\r\n$11\r\nLPUSH_DELAY\r\n$5\r\ntasks\r\n$3\r\nabc\r\n$4\r\ntest\r\n");
+        let mut buf_err = BytesMut::from(
+            "*4\r\n$11\r\nLPUSH_DELAY\r\n$5\r\ntasks\r\n$3\r\nabc\r\n$4\r\ntest\r\n",
+        );
         let (cmd_err, _) = parse_command(&mut buf_err).unwrap().unwrap();
         assert_eq!(cmd_err, Command::Unknown);
     }

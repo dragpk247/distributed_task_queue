@@ -6,7 +6,7 @@
 //! - [`aof`]: Append-Only-File persistence layer with startup replay and online atomic compaction (`BGREWRITEAOF`).
 //! - [`server`]: Asynchronous Tokio TCP server managing client connections, replication streaming, and worker leasing.
 
-pub mod protocol;
-pub mod engine;
 pub mod aof;
+pub mod engine;
+pub mod protocol;
 pub mod server;

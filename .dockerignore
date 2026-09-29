@@ -1,0 +1,8 @@
+# Docker ignore rules to speed up build context
+target/
+.git/
+*.aof*
+*.log
+scratch/
+__pycache__/
+*.pyc

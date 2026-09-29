@@ -1,7 +1,7 @@
+use distributed_task_queue::server::Server;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use distributed_task_queue::server::Server;
 
 async fn start_test_server(port: u16) -> (String, std::path::PathBuf) {
     let addr = format!("127.0.0.1:{}", port);
@@ -89,15 +89,24 @@ async fn test_aof_compaction_command() {
 
     let mut client = TcpStream::connect(&addr).await.unwrap();
     // Push two tasks
-    client.write_all(b"*3\r\n$5\r\nLPUSH\r\n$4\r\ntodo\r\n$5\r\ntask1\r\n").await.unwrap();
+    client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$4\r\ntodo\r\n$5\r\ntask1\r\n")
+        .await
+        .unwrap();
     let mut buf = [0u8; 64];
     let _ = client.read(&mut buf).await.unwrap();
 
-    client.write_all(b"*3\r\n$5\r\nLPUSH\r\n$4\r\ntodo\r\n$5\r\ntask2\r\n").await.unwrap();
+    client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$4\r\ntodo\r\n$5\r\ntask2\r\n")
+        .await
+        .unwrap();
     let _ = client.read(&mut buf).await.unwrap();
 
     // Trigger BGREWRITEAOF
-    client.write_all(b"*1\r\n$12\r\nBGREWRITEAOF\r\n").await.unwrap();
+    client
+        .write_all(b"*1\r\n$12\r\nBGREWRITEAOF\r\n")
+        .await
+        .unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(resp.starts_with("+Background append only file rewriting"));
@@ -112,30 +121,45 @@ async fn test_lease_heartbeat_and_ack_tcp() {
     let mut client = TcpStream::connect(&addr).await.unwrap();
 
     // 1. Push a task
-    client.write_all(b"*3\r\n$5\r\nLPUSH\r\n$8\r\npayments\r\n$11\r\ninvoice_101\r\n").await.unwrap();
+    client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$8\r\npayments\r\n$11\r\ninvoice_101\r\n")
+        .await
+        .unwrap();
     let mut buf = [0u8; 128];
     let n = client.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b":1\r\n");
 
     // 2. Lease the task via RPOPLEASE payments 10 (10s visibility)
-    client.write_all(b"*3\r\n$9\r\nRPOPLEASE\r\n$8\r\npayments\r\n$2\r\n10\r\n").await.unwrap();
+    client
+        .write_all(b"*3\r\n$9\r\nRPOPLEASE\r\n$8\r\npayments\r\n$2\r\n10\r\n")
+        .await
+        .unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(resp.contains("task-1"));
     assert!(resp.contains("invoice_101"));
 
     // 3. Heartbeat / renew lease via TASKTOUCH payments task-1 30
-    client.write_all(b"*4\r\n$9\r\nTASKTOUCH\r\n$8\r\npayments\r\n$6\r\ntask-1\r\n$2\r\n30\r\n").await.unwrap();
+    client
+        .write_all(b"*4\r\n$9\r\nTASKTOUCH\r\n$8\r\npayments\r\n$6\r\ntask-1\r\n$2\r\n30\r\n")
+        .await
+        .unwrap();
     let n = client.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"+OK\r\n");
 
     // 4. Acknowledge task completion via TASKACK payments task-1
-    client.write_all(b"*3\r\n$7\r\nTASKACK\r\n$8\r\npayments\r\n$6\r\ntask-1\r\n").await.unwrap();
+    client
+        .write_all(b"*3\r\n$7\r\nTASKACK\r\n$8\r\npayments\r\n$6\r\ntask-1\r\n")
+        .await
+        .unwrap();
     let n = client.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"+OK\r\n");
 
     // 5. Subsequent ACK should fail with error since task is no longer in-flight
-    client.write_all(b"*3\r\n$7\r\nTASKACK\r\n$8\r\npayments\r\n$6\r\ntask-1\r\n").await.unwrap();
+    client
+        .write_all(b"*3\r\n$7\r\nTASKACK\r\n$8\r\npayments\r\n$6\r\ntask-1\r\n")
+        .await
+        .unwrap();
     let n = client.read(&mut buf).await.unwrap();
     assert!(String::from_utf8_lossy(&buf[..n]).contains("-ERR Task ID not found in-flight"));
 
@@ -227,7 +251,9 @@ async fn test_delayed_task_polling_integration() {
 
     // Push task with 150ms delay
     client
-        .write_all(b"*4\r\n$10\r\nLPUSHDELAY\r\n$6\r\nfuture\r\n$4\r\n0.15\r\n$11\r\nhello_delay\r\n")
+        .write_all(
+            b"*4\r\n$10\r\nLPUSHDELAY\r\n$6\r\nfuture\r\n$4\r\n0.15\r\n$11\r\nhello_delay\r\n",
+        )
         .await
         .unwrap();
     let n = client.read(&mut buf).await.unwrap();
@@ -271,7 +297,12 @@ async fn test_replica_follower_sync_mode() {
     let primary_addr_clone = primary_addr.clone();
     let engine_clone = replica_engine.clone();
     let follower_handle = tokio::spawn(async move {
-        distributed_task_queue::server::start_replica_follower(primary_addr_clone, engine_clone).await;
+        distributed_task_queue::server::start_replica_follower(
+            primary_addr_clone,
+            engine_clone,
+            None,
+        )
+        .await;
     });
 
     // Spawn replica server

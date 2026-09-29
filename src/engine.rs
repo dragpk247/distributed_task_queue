@@ -28,6 +28,8 @@ pub struct TaskItem {
     pub retry_count: u32,
     /// Threshold of retry attempts before permanent escalation to the DLQ.
     pub max_retries: u32,
+    /// Task priority level (higher values dequeued first, default 0).
+    pub priority: u8,
 }
 
 /// An active task currently checked out/leased by an external worker thread.
@@ -85,6 +87,28 @@ impl PartialOrd for DelayedTask {
     }
 }
 
+/// Finds the index of the task with the highest priority closest to the tail.
+///
+/// Iterating from tail (back) to head (front) ensures that among tasks with equal
+/// highest priority, the one closest to the tail (the oldest, preserving FIFO) is chosen.
+#[inline]
+pub(crate) fn find_highest_priority_tail_index(q: &VecDeque<TaskItem>) -> Option<usize> {
+    if q.is_empty() {
+        return None;
+    }
+    let mut best_idx = q.len() - 1;
+    let mut max_priority = q[best_idx].priority;
+
+    // Scan backwards from tail towards head
+    for idx in (0..q.len()).rev() {
+        if q[idx].priority > max_priority {
+            max_priority = q[idx].priority;
+            best_idx = idx;
+        }
+    }
+    Some(best_idx)
+}
+
 /// Internal shared mutable state protected by a read-write lock.
 #[derive(Default)]
 pub struct EngineInner {
@@ -124,15 +148,16 @@ impl QueueEngine {
         }
     }
 
-    /// Pushes an element to the head/front of the queue (`LPUSH`).
+    /// Pushes an element to the head/front of the queue with priority (`LPUSH_PRIORITY`).
     ///
     /// Returns the new total length of the queue. Also broadcasts an event
     /// to awaken any suspended async workers waiting on this queue.
-    pub fn lpush(&self, queue: &str, payload: Vec<u8>) -> usize {
+    pub fn lpush_priority(&self, queue: &str, priority: u8, payload: Vec<u8>) -> usize {
         let item = TaskItem {
             payload,
             retry_count: 0,
             max_retries: DEFAULT_MAX_RETRIES,
+            priority,
         };
         let len = {
             let mut lock = self.inner.write();
@@ -145,20 +170,33 @@ impl QueueEngine {
         len
     }
 
-    /// Pops an element from the tail of the queue (`RPOP`) without leasing.
+    /// Pushes an element to the head/front of the queue (`LPUSH`).
     ///
-    /// Preserves standard Redis FIFO semantics (LPUSH + RPOP = FIFO).
-    pub fn rpop(&self, queue: &str) -> Option<Vec<u8>> {
-        let mut lock = self.inner.write();
-        lock.queues
-            .get_mut(queue)
-            .and_then(|q| q.pop_back().map(|item| item.payload))
+    /// Standard tasks default to priority 0. Returns the new total length of the queue.
+    /// Also broadcasts an event to awaken any suspended async workers waiting on this queue.
+    pub fn lpush(&self, queue: &str, payload: Vec<u8>) -> usize {
+        self.lpush_priority(queue, 0, payload)
     }
 
-    /// Atomically pops from the tail of `source` and prepends to the head of `destination` (`RPOPLPUSH`).
+    /// Pops an element from the queue (`RPOP`) without leasing, respecting task priorities.
+    ///
+    /// Tasks with higher priority are dequeued first. Within the same priority level,
+    /// strict FIFO ordering is maintained (oldest item closest to tail pops first).
+    pub fn rpop(&self, queue: &str) -> Option<Vec<u8>> {
+        let mut lock = self.inner.write();
+        let q = lock.queues.get_mut(queue)?;
+        let idx = find_highest_priority_tail_index(q)?;
+        q.remove(idx).map(|item| item.payload)
+    }
+
+    /// Atomically pops from the tail of `source` (priority-aware) and prepends to the head of `destination` (`RPOPLPUSH`).
     pub fn rpoplpush(&self, source: &str, destination: &str) -> Option<Vec<u8>> {
         let mut lock = self.inner.write();
-        let item = lock.queues.get_mut(source).and_then(|q| q.pop_back())?;
+        let item = {
+            let src_q = lock.queues.get_mut(source)?;
+            let idx = find_highest_priority_tail_index(src_q)?;
+            src_q.remove(idx)?
+        };
         let payload = item.payload.clone();
         let dest_q = lock.queues.entry(destination.to_string()).or_default();
         dest_q.push_front(item);
@@ -166,7 +204,7 @@ impl QueueEngine {
         Some(payload)
     }
 
-    /// Leased Pop: Pops the next task from the tail and tracks it under `in_flight`
+    /// Leased Pop: Pops the next task (priority-aware) and tracks it under `in_flight`
     /// with an active visibility timeout.
     ///
     /// If the worker fails to ACK or crashes, the background lease reaper will
@@ -178,7 +216,11 @@ impl QueueEngine {
         visibility_timeout: Duration,
     ) -> Option<Vec<u8>> {
         let mut lock = self.inner.write();
-        let item = lock.queues.get_mut(queue).and_then(|q| q.pop_back())?;
+        let item = {
+            let q = lock.queues.get_mut(queue)?;
+            let idx = find_highest_priority_tail_index(q)?;
+            q.remove(idx)?
+        };
         let payload = item.payload.clone();
 
         let in_flight = InFlightTask {
@@ -457,6 +499,7 @@ impl QueueEngine {
                         payload: task.payload.clone(),
                         retry_count: 0,
                         max_retries: DEFAULT_MAX_RETRIES,
+                        priority: 0,
                     };
                     lock.queues
                         .entry(task.queue.clone())
@@ -515,6 +558,7 @@ impl QueueEngine {
                     payload,
                     retry_count: 0,
                     max_retries: DEFAULT_MAX_RETRIES,
+                    priority: 0,
                 };
                 q.push_back(item);
             }
@@ -730,5 +774,53 @@ mod tests {
         assert_eq!(purged, 1);
         let stats_purged = engine.get_stats();
         assert_eq!(stats_purged.dlq_counts.get("dlq_test"), None);
+    }
+
+    #[test]
+    fn test_task_priority_ordering() {
+        let engine = QueueEngine::new();
+        // Push tasks with varying priorities:
+        // Priority 0: "low1", "low2"
+        // Priority 5: "med1", "med2"
+        // Priority 10: "high1", "high2"
+        engine.lpush("prio_q", b"low1".to_vec());
+        engine.lpush("prio_q", b"low2".to_vec());
+        engine.lpush_priority("prio_q", 10, b"high1".to_vec());
+        engine.lpush_priority("prio_q", 5, b"med1".to_vec());
+        engine.lpush_priority("prio_q", 10, b"high2".to_vec());
+        engine.lpush_priority("prio_q", 5, b"med2".to_vec());
+
+        // Dequeuing order should be:
+        // 1. Priority 10: "high1" then "high2" (FIFO within priority 10)
+        // 2. Priority 5: "med1" then "med2" (FIFO within priority 5)
+        // 3. Priority 0: "low1" then "low2" (FIFO within priority 0)
+        assert_eq!(engine.rpop("prio_q"), Some(b"high1".to_vec()));
+        assert_eq!(engine.rpop("prio_q"), Some(b"high2".to_vec()));
+        assert_eq!(engine.rpop("prio_q"), Some(b"med1".to_vec()));
+        assert_eq!(engine.rpop("prio_q"), Some(b"med2".to_vec()));
+        assert_eq!(engine.rpop("prio_q"), Some(b"low1".to_vec()));
+        assert_eq!(engine.rpop("prio_q"), Some(b"low2".to_vec()));
+        assert_eq!(engine.rpop("prio_q"), None);
+    }
+
+    #[test]
+    fn test_task_priority_lease_and_transfer() {
+        let engine = QueueEngine::new();
+        engine.lpush("prio_lease", b"low".to_vec());
+        engine.lpush_priority("prio_lease", 8, b"urgent".to_vec());
+
+        // rpop_with_lease should yield urgent (priority 8) first
+        let leased = engine.rpop_with_lease(
+            "prio_lease",
+            "task-prio-1".to_string(),
+            Duration::from_secs(30),
+        );
+        assert_eq!(leased, Some(b"urgent".to_vec()));
+
+        // rpoplpush should transfer remaining task "low"
+        let transferred = engine.rpoplpush("prio_lease", "dest_q");
+        assert_eq!(transferred, Some(b"low".to_vec()));
+        assert_eq!(engine.rpop("prio_lease"), None);
+        assert_eq!(engine.rpop("dest_q"), Some(b"low".to_vec()));
     }
 }

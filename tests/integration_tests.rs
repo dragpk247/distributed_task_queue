@@ -466,3 +466,88 @@ async fn test_http_metrics_and_dashboard_integration() {
         assert_eq!(stats.queue_lengths.get("failing_q"), Some(&1));
     }
 }
+
+#[tokio::test]
+async fn test_task_priority_queue_integration() {
+    let (addr, aof_path) = start_test_server(16385).await;
+
+    let mut client = TcpStream::connect(&addr).await.unwrap();
+
+    // 1. Push low priority task (prio 0 via LPUSH)
+    client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$8\r\nprio_tcp\r\n$4\r\nlow1\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":1\r\n");
+
+    // 2. Push high priority task (prio 10 via LPUSH_PRIORITY)
+    client
+        .write_all(b"*4\r\n$14\r\nLPUSH_PRIORITY\r\n$8\r\nprio_tcp\r\n$2\r\n10\r\n$5\r\nhigh1\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":2\r\n");
+
+    // 3. Push medium priority task (prio 5 via LPUSH_PRIORITY)
+    client
+        .write_all(b"*4\r\n$14\r\nLPUSH_PRIORITY\r\n$8\r\nprio_tcp\r\n$1\r\n5\r\n$4\r\nmed1\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":3\r\n");
+
+    // 4. Push another high priority task (prio 10 via LPUSHPRIORITY alias)
+    client
+        .write_all(b"*4\r\n$13\r\nLPUSHPRIORITY\r\n$8\r\nprio_tcp\r\n$2\r\n10\r\n$5\r\nhigh2\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":4\r\n");
+
+    // 5. Pop via RPOP - should receive high1 (first prio 10 task)
+    client
+        .write_all(b"*2\r\n$4\r\nRPOP\r\n$8\r\nprio_tcp\r\n")
+        .await
+        .unwrap();
+    let mut resp = [0u8; 128];
+    let n = client.read(&mut resp).await.unwrap();
+    assert_eq!(&resp[..n], b"$5\r\nhigh1\r\n");
+
+    // 6. Pop via RPOPLEASE - should receive high2 (second prio 10 task)
+    client
+        .write_all(b"*3\r\n$9\r\nRPOPLEASE\r\n$8\r\nprio_tcp\r\n$2\r\n30\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut resp).await.unwrap();
+    let lease_resp = String::from_utf8_lossy(&resp[..n]);
+    assert!(lease_resp.contains("high2"));
+
+    // 7. Pop via BRPOP - should receive med1 (prio 5 task)
+    client
+        .write_all(b"*3\r\n$5\r\nBRPOP\r\n$8\r\nprio_tcp\r\n$1\r\n1\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut resp).await.unwrap();
+    let brpop_resp = String::from_utf8_lossy(&resp[..n]);
+    assert!(brpop_resp.contains("med1"));
+
+    // 8. Pop via RPOP - should receive low1 (prio 0 task)
+    client
+        .write_all(b"*2\r\n$4\r\nRPOP\r\n$8\r\nprio_tcp\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut resp).await.unwrap();
+    assert_eq!(&resp[..n], b"$4\r\nlow1\r\n");
+
+    // 9. Pop again - queue is now empty
+    client
+        .write_all(b"*2\r\n$4\r\nRPOP\r\n$8\r\nprio_tcp\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut resp).await.unwrap();
+    assert_eq!(&resp[..n], b"$-1\r\n");
+
+    let _ = std::fs::remove_file(&aof_path);
+}

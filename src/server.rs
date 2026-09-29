@@ -217,6 +217,18 @@ pub async fn handle_connection(
                             socket.write_all(&resp_integer(len as i64)).await?;
                         }
 
+                        // Push item to head of queue with priority
+                        Command::LpushPriority {
+                            queue,
+                            priority,
+                            payload,
+                        } => {
+                            let len = ctx.engine.lpush_priority(&queue, priority, payload);
+                            let _ = ctx.aof.append(&raw_frame);
+                            let _ = ctx.replica_stream.send(raw_frame);
+                            socket.write_all(&resp_integer(len as i64)).await?;
+                        }
+
                         // Pop item from tail of queue
                         Command::Rpop { queue } => {
                             let maybe_item = ctx.engine.rpop(&queue);
@@ -600,6 +612,13 @@ pub async fn start_replica_follower(
                                     Ok(Some((cmd, _))) => match cmd {
                                         Command::Lpush { queue, payload } => {
                                             engine.lpush(&queue, payload);
+                                        }
+                                        Command::LpushPriority {
+                                            queue,
+                                            priority,
+                                            payload,
+                                        } => {
+                                            engine.lpush_priority(&queue, priority, payload);
                                         }
                                         Command::Rpop { queue } => {
                                             engine.rpop(&queue);

@@ -83,6 +83,21 @@ impl AofManager {
                             payload,
                             retry_count: 0,
                             max_retries: DEFAULT_MAX_RETRIES,
+                            priority: 0,
+                        };
+                        queues.entry(queue).or_default().push_front(item);
+                        count += 1;
+                    }
+                    Command::LpushPriority {
+                        queue,
+                        priority,
+                        payload,
+                    } => {
+                        let item = TaskItem {
+                            payload,
+                            retry_count: 0,
+                            max_retries: DEFAULT_MAX_RETRIES,
+                            priority,
                         };
                         queues.entry(queue).or_default().push_front(item);
                         count += 1;
@@ -213,11 +228,13 @@ mod tests {
             payload: b"task1".to_vec(),
             retry_count: 0,
             max_retries: 3,
+            priority: 0,
         });
         deque.push_front(TaskItem {
             payload: b"task2".to_vec(),
             retry_count: 0,
             max_retries: 3,
+            priority: 0,
         });
         state.insert("work".to_string(), deque);
 
@@ -229,6 +246,32 @@ mod tests {
         assert_eq!(replayed.get("work").unwrap().len(), 2);
         assert_eq!(replayed.get("work").unwrap()[1].payload, b"task1");
         assert_eq!(replayed.get("work").unwrap()[0].payload, b"task2");
+
+        let _ = std::fs::remove_file(&aof_path);
+    }
+
+    #[test]
+    fn test_aof_replay_priority() {
+        let test_dir = std::env::temp_dir();
+        let aof_path = test_dir.join("test_queue_prio.aof");
+        let _ = std::fs::remove_file(&aof_path);
+
+        let aof = AofManager::open(&aof_path).unwrap();
+        // LPUSH tasks low
+        let frame1 = b"*3\r\n$5\r\nLPUSH\r\n$5\r\ntasks\r\n$3\r\nlow\r\n";
+        aof.append(frame1).unwrap();
+
+        // LPUSH_PRIORITY tasks 10 high
+        let frame2 = b"*4\r\n$14\r\nLPUSH_PRIORITY\r\n$5\r\ntasks\r\n$2\r\n10\r\n$4\r\nhigh\r\n";
+        aof.append(frame2).unwrap();
+
+        let restored = aof.replay().unwrap();
+        let tasks = restored.get("tasks").unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].payload, b"high");
+        assert_eq!(tasks[0].priority, 10);
+        assert_eq!(tasks[1].payload, b"low");
+        assert_eq!(tasks[1].priority, 0);
 
         let _ = std::fs::remove_file(&aof_path);
     }

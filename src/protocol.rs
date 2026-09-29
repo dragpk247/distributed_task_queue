@@ -74,6 +74,13 @@ pub enum Command {
         payload: Vec<u8>,
     },
 
+    /// Push an item with priority level (`LPUSH_PRIORITY <queue> <priority> <payload>`).
+    LpushPriority {
+        queue: String,
+        priority: u8,
+        payload: Vec<u8>,
+    },
+
     /// Authenticate client connection (`AUTH <password>`).
     Auth { password: String },
 
@@ -311,6 +318,21 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
                 Err(_) => Command::Unknown,
             }
         }
+        "LPUSH_PRIORITY" | "LPUSHPRIORITY" if args.len() == 4 => {
+            let queue = String::from_utf8_lossy(&args[1]).into_owned();
+            let prio_str = String::from_utf8_lossy(&args[2]);
+            match prio_str.parse::<u8>() {
+                Ok(priority) => {
+                    let payload = args[3].clone();
+                    Command::LpushPriority {
+                        queue,
+                        priority,
+                        payload,
+                    }
+                }
+                Err(_) => Command::Unknown,
+            }
+        }
         "AUTH" if args.len() == 2 => {
             let password = String::from_utf8_lossy(&args[1]).into_owned();
             Command::Auth { password }
@@ -529,5 +551,52 @@ mod tests {
             }
         );
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_parse_lpush_priority() {
+        // Test LPUSH_PRIORITY
+        let mut buf = BytesMut::from(
+            "*4\r\n$14\r\nLPUSH_PRIORITY\r\n$5\r\ntasks\r\n$2\r\n10\r\n$11\r\nhello world\r\n",
+        );
+        let (cmd, _) = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::LpushPriority {
+                queue: "tasks".to_string(),
+                priority: 10,
+                payload: b"hello world".to_vec(),
+            }
+        );
+        assert!(buf.is_empty());
+
+        // Test LPUSHPRIORITY (alias)
+        let mut buf2 = BytesMut::from(
+            "*4\r\n$13\r\nLPUSHPRIORITY\r\n$6\r\nurgent\r\n$1\r\n5\r\n$4\r\nfast\r\n",
+        );
+        let (cmd2, _) = parse_command(&mut buf2).unwrap().unwrap();
+        assert_eq!(
+            cmd2,
+            Command::LpushPriority {
+                queue: "urgent".to_string(),
+                priority: 5,
+                payload: b"fast".to_vec(),
+            }
+        );
+        assert!(buf2.is_empty());
+
+        // Invalid priority format should map to Unknown
+        let mut buf_err = BytesMut::from(
+            "*4\r\n$14\r\nLPUSH_PRIORITY\r\n$5\r\ntasks\r\n$3\r\nabc\r\n$4\r\ntest\r\n",
+        );
+        let (cmd_err, _) = parse_command(&mut buf_err).unwrap().unwrap();
+        assert_eq!(cmd_err, Command::Unknown);
+
+        // Priority overflow (> 255) should map to Unknown
+        let mut buf_err2 = BytesMut::from(
+            "*4\r\n$14\r\nLPUSH_PRIORITY\r\n$5\r\ntasks\r\n$3\r\n300\r\n$4\r\ntest\r\n",
+        );
+        let (cmd_err2, _) = parse_command(&mut buf_err2).unwrap().unwrap();
+        assert_eq!(cmd_err2, Command::Unknown);
     }
 }

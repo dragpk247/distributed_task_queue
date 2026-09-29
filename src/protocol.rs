@@ -26,6 +26,23 @@ pub enum Command {
         destination: String,
         timeout_secs: f64,
     },
+    /// RPOPLEASE queue [visibility_timeout_secs]
+    RpopLease {
+        queue: String,
+        visibility_secs: f64,
+    },
+    /// BRPOPLEASE queue timeout_seconds [visibility_timeout_secs]
+    BrpopLease {
+        queue: String,
+        timeout_secs: f64,
+        visibility_secs: f64,
+    },
+    /// TASKTOUCH queue task_id [extend_secs]
+    TaskTouch {
+        queue: String,
+        task_id: String,
+        extend_secs: f64,
+    },
     /// TASKACK queue task_id
     TaskAck {
         queue: String,
@@ -172,6 +189,46 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
                 timeout_secs,
             }
         }
+        "RPOPLEASE" if args.len() >= 2 => {
+            let queue = String::from_utf8_lossy(&args[1]).into_owned();
+            let visibility_secs = if args.len() >= 3 {
+                String::from_utf8_lossy(&args[2]).parse::<f64>().unwrap_or(30.0)
+            } else {
+                30.0
+            };
+            Command::RpopLease {
+                queue,
+                visibility_secs,
+            }
+        }
+        "BRPOPLEASE" if args.len() >= 3 => {
+            let queue = String::from_utf8_lossy(&args[1]).into_owned();
+            let timeout_secs = String::from_utf8_lossy(&args[2]).parse::<f64>().unwrap_or(0.0);
+            let visibility_secs = if args.len() >= 4 {
+                String::from_utf8_lossy(&args[3]).parse::<f64>().unwrap_or(30.0)
+            } else {
+                30.0
+            };
+            Command::BrpopLease {
+                queue,
+                timeout_secs,
+                visibility_secs,
+            }
+        }
+        "TASKTOUCH" if args.len() >= 3 => {
+            let queue = String::from_utf8_lossy(&args[1]).into_owned();
+            let task_id = String::from_utf8_lossy(&args[2]).into_owned();
+            let extend_secs = if args.len() >= 4 {
+                String::from_utf8_lossy(&args[3]).parse::<f64>().unwrap_or(30.0)
+            } else {
+                30.0
+            };
+            Command::TaskTouch {
+                queue,
+                task_id,
+                extend_secs,
+            }
+        }
         "TASKACK" if args.len() == 3 => {
             let queue = String::from_utf8_lossy(&args[1]).into_owned();
             let task_id = String::from_utf8_lossy(&args[2]).into_owned();
@@ -315,5 +372,40 @@ mod tests {
         let (cmd2, _) = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd2, Command::Ping);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_parse_rpoplease_brpoplease_tasktouch() {
+        let mut buf = BytesMut::from("*3\r\n$9\r\nRPOPLEASE\r\n$5\r\ntasks\r\n$2\r\n45\r\n");
+        let (cmd, _) = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::RpopLease {
+                queue: "tasks".to_string(),
+                visibility_secs: 45.0
+            }
+        );
+
+        let mut buf2 = BytesMut::from("*4\r\n$10\r\nBRPOPLEASE\r\n$5\r\ntasks\r\n$1\r\n5\r\n$2\r\n60\r\n");
+        let (cmd2, _) = parse_command(&mut buf2).unwrap().unwrap();
+        assert_eq!(
+            cmd2,
+            Command::BrpopLease {
+                queue: "tasks".to_string(),
+                timeout_secs: 5.0,
+                visibility_secs: 60.0,
+            }
+        );
+
+        let mut buf3 = BytesMut::from("*4\r\n$9\r\nTASKTOUCH\r\n$5\r\ntasks\r\n$6\r\njob-99\r\n$2\r\n15\r\n");
+        let (cmd3, _) = parse_command(&mut buf3).unwrap().unwrap();
+        assert_eq!(
+            cmd3,
+            Command::TaskTouch {
+                queue: "tasks".to_string(),
+                task_id: "job-99".to_string(),
+                extend_secs: 15.0,
+            }
+        );
     }
 }

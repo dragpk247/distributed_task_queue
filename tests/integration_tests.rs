@@ -104,3 +104,40 @@ async fn test_aof_compaction_command() {
 
     let _ = std::fs::remove_file(&aof_path);
 }
+
+#[tokio::test]
+async fn test_lease_heartbeat_and_ack_tcp() {
+    let (addr, aof_path) = start_test_server(16382).await;
+
+    let mut client = TcpStream::connect(&addr).await.unwrap();
+
+    // 1. Push a task
+    client.write_all(b"*3\r\n$5\r\nLPUSH\r\n$8\r\npayments\r\n$11\r\ninvoice_101\r\n").await.unwrap();
+    let mut buf = [0u8; 128];
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":1\r\n");
+
+    // 2. Lease the task via RPOPLEASE payments 10 (10s visibility)
+    client.write_all(b"*3\r\n$9\r\nRPOPLEASE\r\n$8\r\npayments\r\n$2\r\n10\r\n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("task-1"));
+    assert!(resp.contains("invoice_101"));
+
+    // 3. Heartbeat / renew lease via TASKTOUCH payments task-1 30
+    client.write_all(b"*4\r\n$9\r\nTASKTOUCH\r\n$8\r\npayments\r\n$6\r\ntask-1\r\n$2\r\n30\r\n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"+OK\r\n");
+
+    // 4. Acknowledge task completion via TASKACK payments task-1
+    client.write_all(b"*3\r\n$7\r\nTASKACK\r\n$8\r\npayments\r\n$6\r\ntask-1\r\n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"+OK\r\n");
+
+    // 5. Subsequent ACK should fail with error since task is no longer in-flight
+    client.write_all(b"*3\r\n$7\r\nTASKACK\r\n$8\r\npayments\r\n$6\r\ntask-1\r\n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("-ERR Task ID not found in-flight"));
+
+    let _ = std::fs::remove_file(&aof_path);
+}

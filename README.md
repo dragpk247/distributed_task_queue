@@ -66,11 +66,14 @@ A high-performance, asynchronous distributed task queue engine built in Rust, po
 | `PING` | `PING` | Health check probe (returns `+PONG`) |
 | `LPUSH` | `LPUSH <queue> <payload>` | Push element to the head of the queue |
 | `RPOP` | `RPOP <queue>` | Pop element from the tail of the queue |
+| `RPOPLEASE` | `RPOPLEASE <queue> [visibility_secs]` | Atomically pop and lease task with unique Task ID & visibility timeout |
+| `BRPOPLEASE` | `BRPOPLEASE <queue> <timeout> [visibility_secs]` | Non-busy blocking pop with lease & Task ID |
+| `TASKTOUCH` | `TASKTOUCH <queue> <task_id> [extend_secs]` | Heartbeat command extending visibility timeout for in-flight tasks |
+| `TASKACK` | `TASKACK <queue> <task_id>` | Acknowledge completed task lease |
+| `TASKNACK` | `TASKNACK <queue> <task_id>` | Negative acknowledge; increments retry count or routes to DLQ |
 | `RPOPLPUSH` | `RPOPLPUSH <source> <dest>` | Atomically pop from tail of source and push to head of destination |
 | `BRPOP` | `BRPOP <queue> [queue ...] <timeout>` | Non-busy blocking pop with timeout (seconds) |
 | `BRPOPLPUSH` | `BRPOPLPUSH <source> <dest> <timeout>`| Blocking pop from source and push to destination with timeout |
-| `TASKACK` | `TASKACK <queue> <task_id>` | Acknowledge completed task lease |
-| `TASKNACK` | `TASKNACK <queue> <task_id>` | Negative acknowledge; increments retry count or routes to DLQ |
 | `BGREWRITEAOF` | `BGREWRITEAOF` | Atomically compacts the AOF log from current memory state |
 | `SYNC` | `SYNC` | Subscribes connected replica node to live mutation byte stream |
 

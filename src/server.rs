@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,6 +18,7 @@ pub struct ServerContext {
     pub aof: Arc<AofManager>,
     /// Broadcast channel streaming raw mutations to any connected replicas
     pub replica_stream: broadcast::Sender<Vec<u8>>,
+    pub task_counter: AtomicU64,
 }
 
 pub struct Server {
@@ -41,6 +43,7 @@ impl Server {
             engine,
             aof,
             replica_stream: replica_tx,
+            task_counter: AtomicU64::new(1),
         });
 
         Ok(Self {
@@ -181,6 +184,73 @@ pub async fn handle_connection(
                                 socket.write_all(&resp_bulk_string(&item)).await?;
                             } else {
                                 socket.write_all(&resp_null()).await?;
+                            }
+                        }
+                        Command::RpopLease {
+                            queue,
+                            visibility_secs,
+                        } => {
+                            let task_num = ctx.task_counter.fetch_add(1, Ordering::Relaxed);
+                            let task_id = format!("task-{}", task_num);
+                            let vis_duration = Duration::from_secs_f64(visibility_secs);
+
+                            if let Some(payload) = ctx.engine.rpop_with_lease(&queue, task_id.clone(), vis_duration) {
+                                let rpop_frame = format!(
+                                    "*2\r\n$4\r\nRPOP\r\n${}\r\n{}\r\n",
+                                    queue.len(),
+                                    queue
+                                ).into_bytes();
+                                let _ = ctx.aof.append(&rpop_frame);
+                                let _ = ctx.replica_stream.send(rpop_frame);
+
+                                let resp = resp_array(&[
+                                    resp_bulk_string(task_id.as_bytes()),
+                                    resp_bulk_string(&payload),
+                                ]);
+                                socket.write_all(&resp).await?;
+                            } else {
+                                socket.write_all(&resp_null()).await?;
+                            }
+                        }
+                        Command::BrpopLease {
+                            queue,
+                            timeout_secs,
+                            visibility_secs,
+                        } => {
+                            let task_num = ctx.task_counter.fetch_add(1, Ordering::Relaxed);
+                            let task_id = format!("task-{}", task_num);
+                            let timeout = Duration::from_secs_f64(timeout_secs);
+                            let vis_duration = Duration::from_secs_f64(visibility_secs);
+
+                            if let Some(payload) = ctx.engine.brpop_lease(&queue, timeout, vis_duration, task_id.clone()).await {
+                                let rpop_frame = format!(
+                                    "*2\r\n$4\r\nRPOP\r\n${}\r\n{}\r\n",
+                                    queue.len(),
+                                    queue
+                                ).into_bytes();
+                                let _ = ctx.aof.append(&rpop_frame);
+                                let _ = ctx.replica_stream.send(rpop_frame);
+
+                                let resp = resp_array(&[
+                                    resp_bulk_string(task_id.as_bytes()),
+                                    resp_bulk_string(&payload),
+                                ]);
+                                socket.write_all(&resp).await?;
+                            } else {
+                                socket.write_all(&resp_null()).await?;
+                            }
+                        }
+                        Command::TaskTouch {
+                            queue,
+                            task_id,
+                            extend_secs,
+                        } => {
+                            let extend_by = Duration::from_secs_f64(extend_secs);
+                            let success = ctx.engine.task_touch(&queue, &task_id, extend_by);
+                            if success {
+                                socket.write_all(&resp_simple_string("OK")).await?;
+                            } else {
+                                socket.write_all(&resp_error("Task ID not found in-flight")).await?;
                             }
                         }
                         Command::TaskAck { queue, task_id } => {

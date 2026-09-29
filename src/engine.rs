@@ -153,6 +153,82 @@ impl QueueEngine {
         }
     }
 
+    /// Extend lease visibility timeout for long running tasks (TASKTOUCH)
+    pub fn task_touch(&self, queue: &str, task_id: &str, extend_by: Duration) -> bool {
+        let mut lock = self.inner.write();
+        if let Some(queue_tasks) = lock.in_flight.get_mut(queue) {
+            if let Some(task) = queue_tasks.get_mut(task_id) {
+                task.leased_at = Instant::now();
+                task.visibility_timeout = extend_by;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Asynchronous blocking pop with lease
+    pub async fn brpop_lease(
+        self: &Arc<Self>,
+        queue: &str,
+        timeout: Duration,
+        visibility_timeout: Duration,
+        task_id: String,
+    ) -> Option<Vec<u8>> {
+        // Fast-path: check if queue already has items
+        if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+            return Some(payload);
+        }
+
+        if timeout.is_zero() {
+            let mut rx = self.notifier.subscribe();
+            loop {
+                if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+                    return Some(payload);
+                }
+                match rx.recv().await {
+                    Ok(q_name) if q_name == queue => {
+                        if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+                            return Some(payload);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+                            return Some(payload);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }
+
+        tokio::select! {
+            result = async {
+                let mut rx = self.notifier.subscribe();
+                loop {
+                    if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+                        return Some(payload);
+                    }
+                    match rx.recv().await {
+                        Ok(q_name) if q_name == queue => {
+                            if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+                                return Some(payload);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if let Some(payload) = self.rpop_with_lease(queue, task_id.clone(), visibility_timeout) {
+                                return Some(payload);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            } => result,
+            _ = tokio::time::sleep(timeout) => None,
+        }
+    }
+
     /// Asynchronous blocking pop on one or more queues with timeout (BRPOP)
     pub async fn brpop(
         self: &Arc<Self>,

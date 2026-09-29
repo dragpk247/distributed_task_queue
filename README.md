@@ -21,7 +21,90 @@ A high-performance, asynchronous distributed task queue engine built in Rust, po
 
 ---
 
-### 🏗️ System Architecture & Workflow Diagrams
+## 🏛️ Layered System Architecture
+
+The project is structured into 6 clear, decoupled architectural layers:
+
+```mermaid
+graph TD
+    subgraph Layer 1: Client & Worker SDKs
+        PySDK["Python SDK (dtq.Worker / TaskQueueClient)"]
+        RedisCli["redis-cli / Standard Redis SDKs"]
+        PromClient["Prometheus Scraper / HTTP Client"]
+    end
+
+    subgraph Layer 2: Transport & Network Layer
+        TcpListen["Tokio TCP Listener (:6379)"]
+        HttpListen["Tokio HTTP Listener (:9090)"]
+    end
+
+    subgraph Layer 3: Protocol & Framing Layer
+        RespParser["RESP Wire Protocol Parser (parse_command)"]
+        AuthGate{"Session Auth Guard (requirepass)"}
+        HttpRouter["HTTP Router (/metrics, /dashboard, /api/stats)"]
+    end
+
+    subgraph Layer 4: Core Execution & Storage Engine
+        Engine["QueueEngine (parking_lot::RwLock)"]
+        Queues[("FIFO Queues: VecDeque<TaskItem>")]
+        Scheduler[("Delayed Min-Heap: BinaryHeap<DelayedTask>")]
+        Leases[("In-Flight Leases: HashMap<task_id, InFlightTask>")]
+        DLQ[("Dead-Letter Queues: HashMap<name, Vec>")]
+        Notifier["Broadcast Event Notifier (tokio::sync::broadcast)"]
+    end
+
+    subgraph Layer 5: Background Autonomous Supervisors
+        Reaper["Lease Reaper Worker (every 1.0s)"]
+        Promoter["Delayed Task Promoter (every 50ms)"]
+    end
+
+    subgraph Layer 6: Durability & High-Availability
+        AOF["AOF Persistence Engine (fsync & BGREWRITEAOF)"]
+        ReplMaster["Replication Stream Broadcast (SYNC)"]
+        ReplFollower["Replica Follower Daemon (--replicaof)"]
+    end
+
+    PySDK -->|TCP Wire Protocol| TcpListen
+    RedisCli -->|TCP Wire Protocol| TcpListen
+    PromClient -->|HTTP GET| HttpListen
+
+    TcpListen --> RespParser
+    RespParser --> AuthGate
+    AuthGate --> Engine
+    HttpListen --> HttpRouter
+    HttpRouter --> Engine
+
+    Engine --> Queues
+    Engine --> Scheduler
+    Engine --> Leases
+    Engine --> DLQ
+    Engine --> Notifier
+
+    Reaper -->|Timeout Expiry / Escalation| Leases
+    Reaper -->|Reclaim| Queues
+    Reaper -->|Escalate| DLQ
+    Promoter -->|Promote Ready Tasks| Scheduler
+    Promoter -->|Push Ready| Queues
+
+    Engine -->|Append Mutations| AOF
+    Engine -->|Broadcast Mutations| ReplMaster
+    ReplMaster -->|Stream Bytes| ReplFollower
+```
+
+### Layer Breakdown
+
+| Layer | Responsibility | Key Modules |
+| :--- | :--- | :--- |
+| **Layer 1: Clients & SDKs** | Ergonomic producers, task decorators, auto-heartbeating, and metrics consumers | `sdk/python/dtq/` (`client.py`, `worker.py`) |
+| **Layer 2: Transport** | High-concurrency asynchronous I/O and socket acceptance loops | `server.rs`, `http_server.rs` |
+| **Layer 3: Protocol & Auth** | Zero-copy RESP frame parsing, response serializers, and session auth validation | `protocol.rs`, `http_server.rs` |
+| **Layer 4: Engine & Storage** | Thread-safe in-memory FIFO queues, visibility leases, min-heap scheduler, DLQs, event broadcaster | `engine.rs` |
+| **Layer 5: Supervisors** | Autonomous background daemon tasks for lease recycling and delayed task promotion | `server.rs`, `engine.rs` |
+| **Layer 6: Durability & HA** | Append-only logging with background atomic compaction and follower replication sync | `aof.rs`, `server.rs` |
+
+---
+
+## 🏗️ System Architecture & Workflow Diagrams
 
 ### 1. High-Level Node Architecture
 

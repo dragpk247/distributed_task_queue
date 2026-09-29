@@ -92,6 +92,19 @@ impl Server {
 
     /// Starts the TCP listener event loop, background lease reaper, and delayed task polling loop.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_with_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("Server received shutdown signal (Ctrl+C). Flushing AOF...");
+        })
+        .await
+    }
+
+    /// Starts the TCP listener event loop with a custom shutdown future.
+    pub async fn run_with_shutdown<F>(&self, shutdown: F) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        tokio::pin!(shutdown);
         let listener = TcpListener::bind(&self.addr).await?;
         tracing::info!("Server listening on {}", self.addr);
 
@@ -118,7 +131,7 @@ impl Server {
             }
         });
 
-        // Main connection acceptance loop with graceful shutdown signal listener
+        // Main connection acceptance loop
         loop {
             tokio::select! {
                 accept_res = listener.accept() => {
@@ -132,8 +145,8 @@ impl Server {
                         }
                     });
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Server received shutdown signal (Ctrl+C). Flushing AOF...");
+                _ = &mut shutdown => {
+                    tracing::info!("Server shutdown signaled. Flushing AOF...");
                     let _ = self.flush_aof();
                     break;
                 }

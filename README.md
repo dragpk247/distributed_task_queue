@@ -321,6 +321,55 @@ cargo clippy --all-targets -- -D warnings
 
 ---
 
+## 🏎️ Benchmarks & Stress Testing
+
+A dedicated benchmark suite binary (`src/bin/bench.rs`) measures end-to-end throughput and tail latency percentiles (P50, P90, P99, P99.9) using HDR Histogram (`hdrhistogram`).
+
+### CLI Options
+
+```bash
+cargo run --bin bench -- [OPTIONS]
+```
+
+| Option | Flag | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--address` | `-a` | *(None)* | Remote or local server address (`<host:port>`). If omitted, starts an ephemeral in-process TCP server. |
+| `--concurrency` | `-c` | `50` | Number of concurrent client tasks / workers |
+| `--requests` | `-r` | `20000` | Total operations per workload |
+| `--payload-size` | `-p` | `64` | Size in bytes for task payload |
+| `--target` | `-t` | `all` | Specific workload: `all`, `lpush`, `rpop`, `lease-ack`, `lpush-delay`, `priority` |
+| `--in-memory` | | `false` | Run direct in-memory `QueueEngine` benchmarks in addition to TCP loopback |
+
+### Running the Benchmark
+
+```bash
+# Run all workloads against an ephemeral TCP server (5,000 reqs, 20 concurrent clients)
+cargo run --bin bench -- --requests 5000 --concurrency 20
+
+# Run in-memory engine benchmark directly
+cargo run --bin bench -- --requests 20000 --concurrency 50 --in-memory
+
+# Benchmark a specific workload against an existing server
+cargo run --bin bench -- --address 127.0.0.1:6379 --target lease-ack --requests 50000 --concurrency 100
+```
+
+### Sample Benchmark Results
+
+*(Executed on Linux with `--requests 5000 --concurrency 20 --in-memory`)*
+
+| Mode | Workload | Throughput | P50 Latency | P90 Latency | P99 Latency | P99.9 Latency |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **TCP** | `LPUSH` (Enqueue 64B) | **~98,000 ops/s** | 169 µs | 227 µs | 290 µs | 332 µs |
+| **TCP** | `RPOP` (Dequeue 64B) | **~19,000 ops/s** | 1.00 ms | 1.75 ms | 3.14 ms | 6.38 ms |
+| **TCP** | `RPOPLEASE` + `TASKACK` | **~15,500 ops/s** | 1.20 ms | 2.09 ms | 2.87 ms | 3.92 ms |
+| **TCP** | `LPUSH_PRIORITY` + `RPOP` | **~51,800 ops/s** | 347 µs | 426 µs | 497 µs | 571 µs |
+| **TCP** | `LPUSH_DELAY` (Delayed 30s) | **~87,000 ops/s** | 178 µs | 251 µs | 844 µs | 1.24 ms |
+| **In-Memory** | `LPUSH` Direct Engine | **~265,000 ops/s** | 30 µs | 98 µs | 206 µs | 299 µs |
+| **In-Memory** | `LPUSH_DELAY` Direct Engine | **~342,000 ops/s** | 20 µs | 74 µs | 163 µs | 248 µs |
+| **In-Memory** | `LPUSH_PRIORITY` + `RPOP` | **~166,000 ops/s** | 55 µs | 172 µs | 325 µs | 621 µs |
+
+---
+
 ## 📄 License
 
 Licensed under either of:

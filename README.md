@@ -170,12 +170,33 @@ Clone the repository and launch the server:
 git clone https://github.com/dragpk247/distributed_task_queue.git
 cd distributed_task_queue
 
-# Run primary master with optional password protection
-cargo run -- --bind 127.0.0.1:6379 --requirepass secret123
+# Run primary master with optional password protection and HTTP metrics & dashboard
+cargo run -- --bind 127.0.0.1:6379 --requirepass secret123 --http-bind 127.0.0.1:9090
 
 # Run replica follower connecting to primary
 cargo run -- --bind 127.0.0.1:6380 --replicaof 127.0.0.1:6379
 ```
+
+### 📊 Embedded Web Dashboard & Prometheus Metrics
+
+When `--http-bind <host:port>` is supplied (e.g. `--http-bind 127.0.0.1:9090`), the server exposes:
+
+- **Web Dashboard (`http://localhost:9090/` or `/dashboard`)**:
+  - Embedded, dark-mode, responsive administration interface.
+  - Live summary metrics: Total Queues, Ready Tasks, In-Flight Tasks, Scheduled Delayed Tasks, and Dead-Letter Queue (DLQ) Tasks.
+  - Auto-refreshing table showing each queue, ready count, leased count, and DLQ count.
+  - Interactive DLQ management buttons: **Requeue DLQ** (re-enqueue for retry) and **Purge DLQ**.
+- **Prometheus Metrics (`http://localhost:9090/metrics`)**:
+  - Scrapes metrics directly in standard Prometheus exposition text format:
+    - `dtq_delayed_tasks_total`: Total scheduled delayed tasks awaiting execution.
+    - `dtq_queue_size{queue="<name>"}`: Ready task count per queue.
+    - `dtq_in_flight_tasks{queue="<name>"}`: Active leased tasks per queue.
+    - `dtq_dead_letter_queue_size{queue="<name>"}`: Escalated failed tasks per queue.
+- **JSON Telemetry API (`http://localhost:9090/api/stats`)**:
+  - Returns current queue engine statistics in JSON format.
+- **DLQ Actions API**:
+  - `/api/dlq/requeue?queue=<name>`: Requeues DLQ tasks back into the ready queue.
+  - `/api/dlq/purge?queue=<name>`: Purges DLQ tasks for the specified queue.
 
 ### Interacting via redis-cli
 

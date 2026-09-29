@@ -29,6 +29,10 @@ struct Args {
     /// Optional password authentication requirement (`AUTH <password>`)
     #[arg(long)]
     requirepass: Option<String>,
+
+    /// Network interface and TCP port to bind the HTTP metrics and dashboard server to (`<host:port>`)
+    #[arg(long)]
+    http_bind: Option<String>,
 }
 
 #[tokio::main]
@@ -56,7 +60,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 5. Run the TCP server loop with signal interruption guarding
+    // 5. If --http-bind is specified, spawn the HTTP server for Prometheus metrics & Dashboard
+    if let Some(http_addr) = args.http_bind {
+        let engine = server.get_engine();
+        tokio::spawn(async move {
+            distributed_task_queue::http_server::start_http_server(http_addr, engine).await;
+        });
+    }
+
+    // 6. Run the TCP server loop with signal interruption guarding
     tokio::select! {
         res = server.run() => {
             if let Err(e) = res {
@@ -68,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 6. Ensure the append-only persistence log is cleanly flushed to disk before exit
+    // 7. Ensure the append-only persistence log is cleanly flushed to disk before exit
     server.flush_aof()?;
     tracing::info!("Persistence AOF ledger flushed. Goodbye!");
 

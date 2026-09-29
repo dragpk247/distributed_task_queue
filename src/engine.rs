@@ -502,6 +502,41 @@ impl QueueEngine {
             delayed_tasks_count: lock.delayed_tasks.len(),
         }
     }
+
+    /// Re-queues all dead-letter queue (DLQ) tasks back to the ready queue for retry.
+    /// Returns the number of items requeued.
+    pub fn requeue_dlq(&self, queue: &str) -> usize {
+        let mut lock = self.inner.write();
+        if let Some(dlq_items) = lock.dead_letter_queues.remove(queue) {
+            let count = dlq_items.len();
+            let q = lock.queues.entry(queue.to_string()).or_default();
+            for payload in dlq_items {
+                let item = TaskItem {
+                    payload,
+                    retry_count: 0,
+                    max_retries: DEFAULT_MAX_RETRIES,
+                };
+                q.push_back(item);
+            }
+            if count > 0 {
+                let _ = self.notifier.send(queue.to_string());
+            }
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Clears and purges all dead-letter queue (DLQ) tasks for the specified queue.
+    /// Returns the number of items purged.
+    pub fn purge_dlq(&self, queue: &str) -> usize {
+        let mut lock = self.inner.write();
+        if let Some(dlq_items) = lock.dead_letter_queues.remove(queue) {
+            dlq_items.len()
+        } else {
+            0
+        }
+    }
 }
 
 /// Snapshot of queue engine state for monitoring and telemetry.
@@ -657,5 +692,43 @@ mod tests {
             result,
             Some(("delayed_q".to_string(), b"delayed_item".to_vec()))
         );
+    }
+
+    #[test]
+    fn test_requeue_and_purge_dlq() {
+        let engine = QueueEngine::new();
+        engine.lpush("dlq_test", b"dead_payload".to_vec());
+
+        // Lease and NACK 3 times to send to DLQ
+        for i in 1..=3 {
+            let task_id = format!("t-{}", i);
+            let _ = engine.rpop_with_lease("dlq_test", task_id.clone(), Duration::from_secs(10));
+            assert!(engine.task_nack("dlq_test", &task_id));
+        }
+
+        let stats = engine.get_stats();
+        assert_eq!(stats.dlq_counts.get("dlq_test"), Some(&1));
+        assert_eq!(stats.queue_lengths.get("dlq_test"), Some(&0));
+
+        // Requeue
+        let requeued = engine.requeue_dlq("dlq_test");
+        assert_eq!(requeued, 1);
+
+        let stats_after = engine.get_stats();
+        assert_eq!(stats_after.dlq_counts.get("dlq_test"), None);
+        assert_eq!(stats_after.queue_lengths.get("dlq_test"), Some(&1));
+
+        // Re-lease and NACK to DLQ again
+        for i in 4..=6 {
+            let task_id = format!("t-{}", i);
+            let _ = engine.rpop_with_lease("dlq_test", task_id.clone(), Duration::from_secs(10));
+            assert!(engine.task_nack("dlq_test", &task_id));
+        }
+
+        // Purge
+        let purged = engine.purge_dlq("dlq_test");
+        assert_eq!(purged, 1);
+        let stats_purged = engine.get_stats();
+        assert_eq!(stats_purged.dlq_counts.get("dlq_test"), None);
     }
 }

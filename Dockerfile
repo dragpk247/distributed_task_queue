@@ -18,7 +18,7 @@ COPY Cargo.toml ./
 
 # Create dummy source files to pre-compile dependencies
 RUN mkdir -p src && \
-    echo "pub mod protocol; pub mod engine; pub mod aof; pub mod server;" > src/lib.rs && \
+    echo "pub mod protocol; pub mod engine; pub mod aof; pub mod server; pub mod http_server;" > src/lib.rs && \
     echo "fn main() {}" > src/main.rs && \
     cargo build --release && \
     rm -rf src target/release/deps/distributed_task_queue*
@@ -50,8 +50,8 @@ USER appuser
 # Persistence volume for AOF logs
 VOLUME ["/data"]
 
-# Expose default Redis-compatible port
-EXPOSE 6379
+# Expose Redis-compatible port and HTTP metrics/dashboard port
+EXPOSE 6379 9090
 
 # Set default entrypoint with configurable persistence path in /data
 ENTRYPOINT ["/usr/local/bin/distributed_task_queue"]

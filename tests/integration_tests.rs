@@ -358,3 +358,111 @@ async fn test_info_command() {
 
     let _ = std::fs::remove_file(&aof_path);
 }
+
+#[tokio::test]
+async fn test_http_metrics_and_dashboard_integration() {
+    use distributed_task_queue::engine::QueueEngine;
+    use distributed_task_queue::http_server::start_http_server;
+    use std::sync::Arc;
+
+    let engine = Arc::new(QueueEngine::new());
+    engine.lpush("web_queue", b"task_alpha".to_vec());
+    engine.lpush("web_queue", b"task_beta".to_vec());
+    let _ = engine.rpop_with_lease("web_queue", "lease-1".to_string(), Duration::from_secs(30));
+
+    // Force an item into DLQ
+    engine.lpush("failing_q", b"poison_pill".to_vec());
+    for i in 1..=3 {
+        let tid = format!("t-fail-{}", i);
+        let _ = engine.rpop_with_lease("failing_q", tid.clone(), Duration::from_secs(30));
+        assert!(engine.task_nack("failing_q", &tid));
+    }
+
+    let http_port = 19091;
+    let http_addr = format!("127.0.0.1:{}", http_port);
+    let engine_clone = Arc::clone(&engine);
+    tokio::spawn(async move {
+        start_http_server(http_addr, engine_clone).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 1. Test /metrics endpoint
+    {
+        let mut client = TcpStream::connect(format!("127.0.0.1:{}", http_port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+
+        assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp_str.contains("dtq_queue_size{queue=\"web_queue\"} 1"));
+        assert!(resp_str.contains("dtq_in_flight_tasks{queue=\"web_queue\"} 1"));
+        assert!(resp_str.contains("dtq_dead_letter_queue_size{queue=\"failing_q\"} 1"));
+    }
+
+    // 2. Test / or /dashboard endpoint
+    {
+        let mut client = TcpStream::connect(format!("127.0.0.1:{}", http_port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /dashboard HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+
+        assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp_str.contains("Distributed Task Queue Dashboard"));
+        assert!(resp_str.contains("Queue Administration"));
+    }
+
+    // 3. Test /api/stats endpoint
+    {
+        let mut client = TcpStream::connect(format!("127.0.0.1:{}", http_port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /api/stats HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+
+        assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp_str.contains("\"total_dlq\":1"));
+        assert!(resp_str.contains("\"total_in_flight\":1"));
+        assert!(resp_str.contains("\"name\":\"web_queue\""));
+        assert!(resp_str.contains("\"name\":\"failing_q\""));
+    }
+
+    // 4. Test /api/dlq/requeue endpoint
+    {
+        let mut client = TcpStream::connect(format!("127.0.0.1:{}", http_port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"POST /api/dlq/requeue?queue=failing_q HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+
+        assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp_str.contains(r#""requeued":1"#));
+
+        // Verify DLQ is now empty and queue has ready item
+        let stats = engine.get_stats();
+        assert_eq!(stats.dlq_counts.get("failing_q"), None);
+        assert_eq!(stats.queue_lengths.get("failing_q"), Some(&1));
+    }
+}

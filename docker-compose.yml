@@ -14,8 +14,11 @@ services:
       - "/data/master_persistence.aof"
       - "--requirepass"
       - "supersecretpass"
+      - "--http-bind"
+      - "0.0.0.0:9090"
     ports:
       - "6379:6379"
+      - "9090:9090"
     volumes:
       - master-data:/data
     restart: unless-stopped

@@ -6,53 +6,83 @@ A high-performance, asynchronous distributed task queue engine built in Rust, po
 
 ## ⚡ Overview
 
-`distributed_task_queue` is designed as a lightweight, low-latency task broker and coordination engine. It implements an asynchronous TCP event loop that accepts client connections, parses streaming protocol frames, and provides thread-safe in-memory queue primitives.
+`distributed_task_queue` is a lightweight, low-latency distributed task broker and coordination engine. It implements an asynchronous TCP event loop, complete RESP wire protocol parsing, atomic queue primitives, visibility timeouts with Dead-Letter Queues (DLQ), Append-Only File (AOF) persistence with background compaction (`BGREWRITEAOF`), and live primary-to-replica mutation streaming.
 
 ### Key Highlights
 
-- **Asynchronous Network I/O**: Non-blocking TCP server built on [Tokio](https://tokio.rs/), spawning lightweight tasks per connected client.
-- **Concurrent In-Memory Queues**: Thread-safe task state backed by `parking_lot::RwLock` for low-overhead read/write locking across worker threads.
-- **RESP Protocol Interface**: Wire-level compatibility with the Redis Serialization Protocol (listening by default on port `6379`), enabling native integration with existing Redis clients and CLIs.
-- **Efficient Buffer Management**: Chunked streaming and zero-copy slicing powered by [`bytes::BytesMut`](https://docs.rs/bytes).
-- **Structured Telemetry**: Diagnostic tracing and event logging via [`tracing`](https://docs.rs/tracing) and [`tracing-subscriber`](https://docs.rs/tracing-subscriber).
+- **Asynchronous Network I/O**: Non-blocking TCP server built on [Tokio](https://tokio.rs/), serving clients concurrently.
+- **Concurrent In-Memory Engine**: Thread-safe task state backed by `parking_lot::RwLock` for low-overhead read/write locking across worker threads.
+- **RESP Protocol Interface**: Wire-level compatibility with the Redis Serialization Protocol (by default on port `6379`), enabling native integration with existing Redis clients, CLIs, and microservices.
+- **Non-Busy Blocking Pop (`BRPOP` & `BRPOPLPUSH`)**: Event-driven notification broadcasting via Tokio channels, allowing worker threads to suspend awaiting tasks without spinning CPU cycles.
+- **Visibility Timeouts & Dead-Letter Queue (DLQ)**: Lease-based task dispatch with automatic background reaper recycling unacknowledged tasks (`TASKACK`) and routing repeatedly failed tasks (`TASKNACK`) to a DLQ after max retries.
+- **AOF Persistence & Log Compaction (`BGREWRITEAOF`)**: Continuous append-only mutation persistence, startup state replay, and online atomic log compaction.
+- **Node Replication (`SYNC`)**: Live real-time replication stream pushing mutations to replica nodes.
+- **Structured Telemetry & High Test Coverage**: Unit and integration test suites covering protocol parsing, concurrent queue semantics, and TCP loopback operations.
 
 ---
 
 ## 🏗️ Architecture
 
 ```text
-       Client (redis-cli / worker)
-                  │
-                  ▼ [TCP :6379]
-        ┌───────────────────┐
-        │ Tokio TCP Listener│
-        └─────────┬─────────┘
-                  │ spawns per connection
-                  ▼
-        ┌───────────────────┐
-        │   handle_client   │ ──► Reads into BytesMut buffer
-        └─────────┬─────────┘
-                  │ CRLF frame evaluation
-                  ▼
-       ┌─────────────────────┐
-       │ Arc<RwLock<Engine>> │
-       │ ┌─────────────────┐ │
-       │ │ Queue: "tasks"  │ │ ──► VecDeque<Vec<u8>>
-       │ │ Queue: "events" │ │
-       │ └─────────────────┘ │
-       └─────────────────────┘
+       Client (redis-cli / worker / producer)
+                         │
+                         ▼ [TCP :6379]
+               ┌───────────────────┐
+               │ Tokio TCP Listener│
+               └─────────┬─────────┘
+                         │ spawns per connection
+                         ▼
+               ┌───────────────────┐
+               │  Connection Loop  │ ──► Reads into BytesMut buffer
+               └─────────┬─────────┘
+                         │ Frame Parser (RESP)
+                         ▼
+        ┌────────────────────────────────────────────────────────┐
+        │                  Queue Engine                          │
+        │                                                        │
+        │ ┌─────────────────────────┐  ┌───────────────────────┐ │
+        │ │ FIFO Queues (TaskItem)  │  │ In-Flight Leases      │ │
+        │ └───────────┬─────────────┘  └──────────┬────────────┘ │
+        │             │                           │              │
+        │             ▼                           ▼              │
+        │ ┌─────────────────────────┐  ┌───────────────────────┐ │
+        │ │ Broadcast Notifier      │  │ Dead Letter Queues    │ │
+        │ └─────────────────────────┘  └───────────────────────┘ │
+        └──────────────┬──────────────────────────┬──────────────┘
+                       │                          │
+                       ▼                          ▼
+          ┌─────────────────────────┐   ┌───────────────────┐
+          │  AOF Persistence Engine │   │ Replica Stream tx │
+          │ (Replay & Compaction)   │   │  (SYNC Protocol)  │
+          └─────────────────────────┘   └───────────────────┘
 ```
+
+---
+
+## 🛠️ Supported Commands
+
+| Command | Syntax | Description |
+| :--- | :--- | :--- |
+| `PING` | `PING` | Health check probe (returns `+PONG`) |
+| `LPUSH` | `LPUSH <queue> <payload>` | Push element to the head of the queue |
+| `RPOP` | `RPOP <queue>` | Pop element from the tail of the queue |
+| `RPOPLPUSH` | `RPOPLPUSH <source> <dest>` | Atomically pop from tail of source and push to head of destination |
+| `BRPOP` | `BRPOP <queue> [queue ...] <timeout>` | Non-busy blocking pop with timeout (seconds) |
+| `BRPOPLPUSH` | `BRPOPLPUSH <source> <dest> <timeout>`| Blocking pop from source and push to destination with timeout |
+| `TASKACK` | `TASKACK <queue> <task_id>` | Acknowledge completed task lease |
+| `TASKNACK` | `TASKNACK <queue> <task_id>` | Negative acknowledge; increments retry count or routes to DLQ |
+| `BGREWRITEAOF` | `BGREWRITEAOF` | Atomically compacts the AOF log from current memory state |
+| `SYNC` | `SYNC` | Subscribes connected replica node to live mutation byte stream |
 
 ---
 
 ## 📦 Dependencies
 
-- **[tokio](https://crates.io/crates/tokio)**: Asynchronous runtime with full networking primitives.
-- **[bytes](https://crates.io/crates/bytes)**: Utilities for zero-copy byte buffers.
-- **[parking_lot](https://crates.io/crates/parking_lot)**: Fast, compact synchronization primitives.
-- **[crossbeam-channel](https://crates.io/crates/crossbeam-channel)**: Multi-producer multi-consumer channels.
+- **[tokio](https://crates.io/crates/tokio)**: Asynchronous runtime with full networking and synchronization primitives.
+- **[bytes](https://crates.io/crates/bytes)**: Zero-copy slicing and efficient binary buffers.
+- **[parking_lot](https://crates.io/crates/parking_lot)**: Fast, compact synchronization locks (`RwLock`, `Mutex`).
 - **[clap](https://crates.io/crates/clap)**: Command-line argument parsing.
-- **[tracing](https://crates.io/crates/tracing)** / **[tracing-subscriber](https://crates.io/crates/tracing-subscriber)**: Production-grade observability.
+- **[tracing](https://crates.io/crates/tracing)** / **[tracing-subscriber](https://crates.io/crates/tracing-subscriber)**: Production-grade observability and diagnostic logging.
 
 ---
 
@@ -60,10 +90,10 @@ A high-performance, asynchronous distributed task queue engine built in Rust, po
 
 ### Prerequisites
 
-Ensure you have a recent version of the Rust toolchain installed:
+Ensure you have the Rust toolchain installed:
 
 ```bash
-rustc --version # 1.80+ recommended
+rustc --version
 cargo --version
 ```
 
@@ -75,44 +105,46 @@ Clone the repository and launch the server:
 git clone https://github.com/dragpk247/distributed_task_queue.git
 cd distributed_task_queue
 
-# Run in debug mode with info tracing enabled
-RUST_LOG=info cargo run
+# Run in debug mode with info logging enabled
+RUST_LOG=info cargo run -- --bind 127.0.0.1:6379 --aof queue_persistence.aof
 
 # Or build optimized release binary
 cargo build --release
-./target/release/distributed_task_queue
+./target/release/distributed_task_queue --bind 127.0.0.1:6379
 ```
 
-### Testing the Connection
-
-Once running on `127.0.0.1:6379`, you can verify the connection using `nc` or `redis-cli`:
+### Interacting via redis-cli
 
 ```bash
-# Using netcat
-echo -e "PING\r\n" | nc 127.0.0.1 6379
-# Response: +OK
+# Push tasks
+redis-cli -p 6379 LPUSH jobs "process_video_1"
+redis-cli -p 6379 LPUSH jobs "generate_report_2"
 
-# Using redis-cli
-redis-cli -p 6379
+# Non-blocking pop
+redis-cli -p 6379 RPOP jobs
+
+# Blocking pop (waits up to 10 seconds for a task)
+redis-cli -p 6379 BRPOP jobs 10
+
+# Trigger AOF compaction
+redis-cli -p 6379 BGREWRITEAOF
 ```
 
----
+### Running Test Suite
 
-## 🗺️ Roadmap
+```bash
+# Run unit and integration tests
+cargo test
 
-- [ ] Full RESP2 / RESP3 binary frame parser and serializer.
-- [ ] Task acknowledgment (`ACK`), dead-letter queues (`DLQ`), and visibility timeouts.
-- [ ] Worker heartbeat registry and health monitoring.
-- [ ] Priority scheduling and delayed execution queues.
-- [ ] Write-Ahead Logging (WAL) and snapshot persistence to disk.
-- [ ] Multi-node clustering and raft consensus for distributed fault tolerance.
+# Run linter
+cargo clippy --all-targets
+```
 
 ---
 
 ## 📄 License
 
 Licensed under either of:
-
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 

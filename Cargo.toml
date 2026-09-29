@@ -3,6 +3,15 @@ name = "distributed_task_queue"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "distributed_task_queue"
+path = "src/lib.rs"
+
+[[bin]]
+name = "distributed_task_queue"
+path = "src/main.rs"
+
+
 [dependencies]
 # Async runtime & networking
 tokio = { version = "1.40", features = ["full"] }

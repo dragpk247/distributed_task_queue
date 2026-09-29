@@ -477,6 +477,44 @@ impl QueueEngine {
 
         promoted
     }
+
+    /// Gathers high-level telemetry and status metrics across all queues and leases.
+    pub fn get_stats(&self) -> EngineStats {
+        let lock = self.inner.read();
+        let mut queue_lengths = HashMap::new();
+        let mut in_flight_counts = HashMap::new();
+        let mut dlq_counts = HashMap::new();
+
+        for (q, items) in lock.queues.iter() {
+            queue_lengths.insert(q.clone(), items.len());
+        }
+        for (q, items) in lock.in_flight.iter() {
+            in_flight_counts.insert(q.clone(), items.len());
+        }
+        for (q, items) in lock.dead_letter_queues.iter() {
+            dlq_counts.insert(q.clone(), items.len());
+        }
+
+        EngineStats {
+            queue_lengths,
+            in_flight_counts,
+            dlq_counts,
+            delayed_tasks_count: lock.delayed_tasks.len(),
+        }
+    }
+}
+
+/// Snapshot of queue engine state for monitoring and telemetry.
+#[derive(Debug, Clone, Default)]
+pub struct EngineStats {
+    /// Number of items ready per queue.
+    pub queue_lengths: HashMap<String, usize>,
+    /// Number of items currently leased per queue.
+    pub in_flight_counts: HashMap<String, usize>,
+    /// Number of items routed to dead-letter queue per queue.
+    pub dlq_counts: HashMap<String, usize>,
+    /// Total count of scheduled delayed tasks awaiting execution time.
+    pub delayed_tasks_count: usize,
 }
 
 #[cfg(test)]

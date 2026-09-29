@@ -481,6 +481,31 @@ pub async fn handle_connection(
                             socket.write_all(&resp_simple_string("OK")).await?;
                         }
 
+                        // Diagnostic information & metrics probe
+                        Command::Info => {
+                            let stats = ctx.engine.get_stats();
+                            let mut info_text = String::from("# QueueEngine\r\n");
+                            info_text.push_str(&format!(
+                                "delayed_tasks:{}\r\n",
+                                stats.delayed_tasks_count
+                            ));
+
+                            info_text.push_str("# Queues\r\n");
+                            for (q, len) in &stats.queue_lengths {
+                                info_text.push_str(&format!(
+                                    "queue_{}:{};in_flight:{};dlq:{}\r\n",
+                                    q,
+                                    len,
+                                    stats.in_flight_counts.get(q).unwrap_or(&0),
+                                    stats.dlq_counts.get(q).unwrap_or(&0)
+                                ));
+                            }
+
+                            socket
+                                .write_all(&resp_bulk_string(info_text.as_bytes()))
+                                .await?;
+                        }
+
                         Command::Unknown => {
                             socket
                                 .write_all(&resp_error("unknown command or syntax error"))

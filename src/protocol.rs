@@ -77,6 +77,9 @@ pub enum Command {
     /// Authenticate client connection (`AUTH <password>`).
     Auth { password: String },
 
+    /// Diagnostic server and queue engine information (`INFO`).
+    Info,
+
     /// Fallback for unrecognized commands or malformed argument counts.
     Unknown,
 }
@@ -312,6 +315,7 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
             let password = String::from_utf8_lossy(&args[1]).into_owned();
             Command::Auth { password }
         }
+        "INFO" => Command::Info,
         _ => Command::Unknown,
     };
 

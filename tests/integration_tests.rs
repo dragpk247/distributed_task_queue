@@ -334,3 +334,27 @@ async fn test_replica_follower_sync_mode() {
     let _ = std::fs::remove_file(&primary_aof);
     let _ = std::fs::remove_file(&replica_aof);
 }
+
+#[tokio::test]
+async fn test_info_command() {
+    let (addr, aof_path) = start_test_server(16388).await;
+    let mut client = TcpStream::connect(&addr).await.unwrap();
+
+    // Push an item and a delayed task
+    client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$7\r\nmyqueue\r\n$5\r\nitem1\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 512];
+    let _ = client.read(&mut buf).await.unwrap();
+
+    // Query INFO
+    client.write_all(b"*1\r\n$4\r\nINFO\r\n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+
+    assert!(resp.contains("# QueueEngine"));
+    assert!(resp.contains("myqueue"));
+
+    let _ = std::fs::remove_file(&aof_path);
+}

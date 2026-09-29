@@ -126,8 +126,20 @@ sequenceDiagram
 | `BRPOPLPUSH` | `BRPOPLPUSH <source> <dest> <timeout>`| Blocking pop from source and push to destination with timeout |
 | `BGREWRITEAOF` | `BGREWRITEAOF` | Atomically compacts the AOF log from current memory state |
 | `SYNC` | `SYNC` | Subscribes connected replica node to live mutation byte stream |
+| `INFO` | `INFO` | Reports queue metrics, in-flight leases, and DLQ counts |
 
 ---
+
+## 🐳 Docker & Cluster Deployment
+
+Run a complete distributed cluster with primary master and live follower replica in one command:
+
+```bash
+docker compose up --build
+```
+
+- **Master Node**: listening on `0.0.0.0:6379` with authentication (`supersecretpass`) and persistent storage volume.
+- **Replica Follower**: listening on `0.0.0.0:6380`, connected to master with auto-reconnecting live replication.
 
 ## 📦 Dependencies
 

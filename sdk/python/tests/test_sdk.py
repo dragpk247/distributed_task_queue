@@ -292,6 +292,72 @@ class TestMockClientProtocol(unittest.TestCase):
         self.assertEqual(info["queues"]["orders"]["dlq"], 1)
         self.assertEqual(info["queues"]["emails"]["length"], 0)
 
+    def test_dlq_list(self):
+        # Without limit
+        def respond_list():
+            cmd = self.pair.server_recv_command()
+            self.assertIn(b"DLQ_LIST", cmd)
+            self.assertIn(b"failed_q", cmd)
+            self.pair.server_respond(b"*2\r\n$7\r\nerror_1\r\n$7\r\nerror_2\r\n")
+
+        t = threading.Thread(target=respond_list)
+        t.start()
+        items = self.client.dlq_list("failed_q")
+        self.assertEqual(items, [b"error_1", b"error_2"])
+        t.join()
+
+        # With limit
+        def respond_list_limit():
+            cmd = self.pair.server_recv_command()
+            self.assertIn(b"DLQ_LIST", cmd)
+            self.assertIn(b"failed_q", cmd)
+            self.assertIn(b"5", cmd)
+            self.pair.server_respond(b"*1\r\n$7\r\nerror_1\r\n")
+
+        t2 = threading.Thread(target=respond_list_limit)
+        t2.start()
+        items_limited = self.client.dlq_list("failed_q", limit=5)
+        self.assertEqual(items_limited, [b"error_1"])
+        t2.join()
+
+        # Empty list
+        def respond_list_empty():
+            _ = self.pair.server_recv_command()
+            self.pair.server_respond(b"*0\r\n")
+
+        t3 = threading.Thread(target=respond_list_empty)
+        t3.start()
+        items_empty = self.client.dlq_list("empty_q")
+        self.assertEqual(items_empty, [])
+        t3.join()
+
+    def test_dlq_purge(self):
+        def respond_purge():
+            cmd = self.pair.server_recv_command()
+            self.assertIn(b"DLQ_PURGE", cmd)
+            self.assertIn(b"failed_q", cmd)
+            self.pair.server_respond(b":3\r\n")
+
+        t = threading.Thread(target=respond_purge)
+        t.start()
+        count = self.client.dlq_purge("failed_q")
+        self.assertEqual(count, 3)
+        t.join()
+
+    def test_dlq_replay(self):
+        def respond_replay():
+            cmd = self.pair.server_recv_command()
+            self.assertIn(b"DLQ_REPLAY", cmd)
+            self.assertIn(b"failed_q", cmd)
+            self.pair.server_respond(b":5\r\n")
+
+        t = threading.Thread(target=respond_replay)
+        t.start()
+        count = self.client.dlq_replay("failed_q")
+        self.assertEqual(count, 5)
+        t.join()
+
+
 
 class MockQueueClient:
     """Mock client for testing Worker logic in complete isolation without sockets."""

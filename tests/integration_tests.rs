@@ -489,7 +489,7 @@ async fn test_http_metrics_and_dashboard_integration() {
 
 #[tokio::test]
 async fn test_task_priority_queue_integration() {
-    let (addr, aof_path) = start_test_server(16385).await;
+    let (addr, aof_path) = start_test_server(16389).await;
 
     let mut client = TcpStream::connect(&addr).await.unwrap();
 
@@ -662,4 +662,154 @@ async fn test_manual_failover_promotion() {
 
     let _ = std::fs::remove_file(&primary_aof);
     let _ = std::fs::remove_file(&replica_aof);
+}
+
+#[tokio::test]
+async fn test_dlq_wire_commands_integration() {
+    let (addr, aof_path) = start_test_server(16392).await;
+
+    let mut client = TcpStream::connect(&addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. LPUSH task into dlq_test_q
+    client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$10\r\ndlq_test_q\r\n$7\r\npoison1\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":1\r\n");
+
+    // 2. Lease and NACK 3 times to exceed DEFAULT_MAX_RETRIES (3) and land in DLQ
+    for _ in 0..3 {
+        // Lease via RPOPLEASE dlq_test_q 10
+        client
+            .write_all(b"*3\r\n$9\r\nRPOPLEASE\r\n$10\r\ndlq_test_q\r\n$2\r\n10\r\n")
+            .await
+            .unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        // Extract task id (e.g. task-1, task-2, etc.)
+        let task_id = if resp.contains("task-1") {
+            "task-1"
+        } else if resp.contains("task-2") {
+            "task-2"
+        } else if resp.contains("task-3") {
+            "task-3"
+        } else {
+            panic!("Unexpected lease response: {}", resp);
+        };
+
+        // TASKNACK dlq_test_q <task_id>
+        let nack_cmd = format!(
+            "*3\r\n$8\r\nTASKNACK\r\n$10\r\ndlq_test_q\r\n${}\r\n{}\r\n",
+            task_id.len(),
+            task_id
+        );
+        client.write_all(nack_cmd.as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"+OK\r\n");
+    }
+
+    // 3. Queue should now be empty and item in DLQ
+    // Verify DLQ_LIST returns 1 item containing "poison1"
+    client
+        .write_all(b"*2\r\n$8\r\nDLQ_LIST\r\n$10\r\ndlq_test_q\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let list_resp = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(list_resp, "*1\r\n$7\r\npoison1\r\n");
+
+    // 4. Test DLQ_LIST with limit 0
+    client
+        .write_all(b"*3\r\n$8\r\nDLQ_LIST\r\n$10\r\ndlq_test_q\r\n$1\r\n0\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"*0\r\n");
+
+    // 5. DLQ_REPLAY dlq_test_q -> should return :1\r\n (1 item requeued)
+    client
+        .write_all(b"*2\r\n$10\r\nDLQ_REPLAY\r\n$10\r\ndlq_test_q\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":1\r\n");
+
+    // 6. Item should now be in ready queue -> RPOP dlq_test_q returns poison1
+    client
+        .write_all(b"*2\r\n$4\r\nRPOP\r\n$10\r\ndlq_test_q\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"$7\r\npoison1\r\n");
+
+    // DLQ should now be empty
+    client
+        .write_all(b"*2\r\n$8\r\nDLQ_LIST\r\n$10\r\ndlq_test_q\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"*0\r\n");
+
+    // 7. Push a new task and NACK it 3 times into DLQ to test DLQ_PURGE
+    client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$10\r\ndlq_test_q\r\n$7\r\npoison2\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":1\r\n");
+
+    for _ in 0..3 {
+        client
+            .write_all(b"*3\r\n$9\r\nRPOPLEASE\r\n$10\r\ndlq_test_q\r\n$2\r\n10\r\n")
+            .await
+            .unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        let task_id = if resp.contains("task-4") {
+            "task-4"
+        } else if resp.contains("task-5") {
+            "task-5"
+        } else if resp.contains("task-6") {
+            "task-6"
+        } else {
+            panic!("Unexpected lease response: {}", resp);
+        };
+
+        let nack_cmd = format!(
+            "*3\r\n$8\r\nTASKNACK\r\n$10\r\ndlq_test_q\r\n${}\r\n{}\r\n",
+            task_id.len(),
+            task_id
+        );
+        client.write_all(nack_cmd.as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"+OK\r\n");
+    }
+
+    // Verify DLQ has 1 item
+    client
+        .write_all(b"*2\r\n$8\r\nDLQ_LIST\r\n$10\r\ndlq_test_q\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"*1\r\n$7\r\npoison2\r\n");
+
+    // Purge DLQ via DLQ_PURGE dlq_test_q
+    client
+        .write_all(b"*2\r\n$9\r\nDLQ_PURGE\r\n$10\r\ndlq_test_q\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":1\r\n");
+
+    // Verify DLQ is now empty
+    client
+        .write_all(b"*2\r\n$8\r\nDLQ_LIST\r\n$10\r\ndlq_test_q\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"*0\r\n");
+
+    let _ = std::fs::remove_file(&aof_path);
 }

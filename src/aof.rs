@@ -59,8 +59,11 @@ impl AofManager {
         lock.flush()
     }
 
-    /// Replays the AOF ledger sequentially upon server startup to reconstruct in-memory queues.
-    pub fn replay(&self) -> std::io::Result<HashMap<String, VecDeque<TaskItem>>> {
+    /// Replays the AOF ledger sequentially upon server startup to reconstruct in-memory queues and state.
+    pub fn replay(
+        &self,
+        engine: &crate::engine::QueueEngine,
+    ) -> std::io::Result<HashMap<String, VecDeque<TaskItem>>> {
         let mut queues: HashMap<String, VecDeque<TaskItem>> = HashMap::new();
         let file = OpenOptions::new().read(true).open(&self.file_path);
         let Ok(f) = file else {
@@ -115,6 +118,14 @@ impl AofManager {
                         if let Some(item) = queues.get_mut(&source).and_then(|q| q.pop_back()) {
                             queues.entry(destination).or_default().push_front(item);
                         }
+                        count += 1;
+                    }
+                    Command::DlqPurge { queue } => {
+                        engine.purge_dlq(&queue);
+                        count += 1;
+                    }
+                    Command::DlqReplay { queue } => {
+                        engine.requeue_dlq(&queue);
                         count += 1;
                     }
                     _ => {}
@@ -206,7 +217,8 @@ mod tests {
         let frame2 = b"*3\r\n$5\r\nLPUSH\r\n$5\r\ntasks\r\n$5\r\ntask2\r\n";
         aof.append(frame2).unwrap();
 
-        let restored = aof.replay().unwrap();
+        let engine = crate::engine::QueueEngine::new();
+        let restored = aof.replay(&engine).unwrap();
         assert_eq!(restored.get("tasks").unwrap().len(), 2);
         assert_eq!(restored.get("tasks").unwrap()[1].payload, b"task1"); // oldest item at back
         assert_eq!(restored.get("tasks").unwrap()[0].payload, b"task2"); // newest item at front
@@ -242,7 +254,8 @@ mod tests {
         assert_eq!(count, 2);
 
         // Replay compacted log
-        let replayed = aof.replay().unwrap();
+        let engine = crate::engine::QueueEngine::new();
+        let replayed = aof.replay(&engine).unwrap();
         assert_eq!(replayed.get("work").unwrap().len(), 2);
         assert_eq!(replayed.get("work").unwrap()[1].payload, b"task1");
         assert_eq!(replayed.get("work").unwrap()[0].payload, b"task2");
@@ -265,13 +278,35 @@ mod tests {
         let frame2 = b"*4\r\n$14\r\nLPUSH_PRIORITY\r\n$5\r\ntasks\r\n$2\r\n10\r\n$4\r\nhigh\r\n";
         aof.append(frame2).unwrap();
 
-        let restored = aof.replay().unwrap();
+        let engine = crate::engine::QueueEngine::new();
+        let restored = aof.replay(&engine).unwrap();
         let tasks = restored.get("tasks").unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].payload, b"high");
         assert_eq!(tasks[0].priority, 10);
         assert_eq!(tasks[1].payload, b"low");
         assert_eq!(tasks[1].priority, 0);
+
+        let _ = std::fs::remove_file(&aof_path);
+    }
+
+    #[test]
+    fn test_aof_replay_dlq() {
+        let test_dir = std::env::temp_dir();
+        let aof_path = test_dir.join("test_queue_dlq_replay.aof");
+        let _ = std::fs::remove_file(&aof_path);
+
+        let aof = AofManager::open(&aof_path).unwrap();
+        // DLQ_PURGE tasks
+        let purge_frame = b"*2\r\n$9\r\nDLQ_PURGE\r\n$5\r\ntasks\r\n";
+        aof.append(purge_frame).unwrap();
+
+        // DLQ_REPLAY tasks
+        let replay_frame = b"*2\r\n$10\r\nDLQ_REPLAY\r\n$5\r\ntasks\r\n";
+        aof.append(replay_frame).unwrap();
+
+        let engine = crate::engine::QueueEngine::new();
+        let _ = aof.replay(&engine).unwrap();
 
         let _ = std::fs::remove_file(&aof_path);
     }

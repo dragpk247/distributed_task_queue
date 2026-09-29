@@ -198,12 +198,16 @@ sequenceDiagram
 | `AUTH` | `AUTH <password>` | Authenticate client session when `--requirepass` is set |
 | `LPUSH` | `LPUSH <queue> <payload>` | Push element to the head of the queue |
 | `LPUSH_DELAY` | `LPUSH_DELAY <queue> <delay_secs> <payload>` | Schedule an item to be enqueued after `delay_secs` |
+| `LPUSH_PRIORITY` | `LPUSH_PRIORITY <queue> <priority> <payload>` | Push element with priority 0-255 (higher priority popped first) |
 | `RPOP` | `RPOP <queue>` | Pop element from the tail of the queue |
 | `RPOPLEASE` | `RPOPLEASE <queue> [visibility_secs]` | Atomically pop and lease task with unique Task ID & visibility timeout |
 | `BRPOPLEASE` | `BRPOPLEASE <queue> <timeout> [visibility_secs]` | Non-busy blocking pop with lease & Task ID |
 | `TASKTOUCH` | `TASKTOUCH <queue> <task_id> [extend_secs]` | Heartbeat command extending visibility timeout for in-flight tasks |
 | `TASKACK` | `TASKACK <queue> <task_id>` | Acknowledge completed task lease |
 | `TASKNACK` | `TASKNACK <queue> <task_id>` | Negative acknowledge; increments retry count or routes to DLQ |
+| `DLQ_LIST` | `DLQ_LIST <queue> [limit]` | List permanently failed items in the Dead-Letter Queue |
+| `DLQ_PURGE` | `DLQ_PURGE <queue>` | Purge and delete all items in the Dead-Letter Queue |
+| `DLQ_REPLAY` | `DLQ_REPLAY <queue>` | Re-queue all Dead-Letter Queue items back into the ready queue |
 | `RPOPLPUSH` | `RPOPLPUSH <source> <dest>` | Atomically pop from tail of source and push to head of destination |
 | `BRPOP` | `BRPOP <queue> [queue ...] <timeout>` | Non-busy blocking pop with timeout (seconds) |
 | `BRPOPLPUSH` | `BRPOPLPUSH <source> <dest> <timeout>`| Blocking pop from source and push to destination with timeout |
@@ -309,7 +313,12 @@ redis-cli -p 6379 TASKACK jobs task-1
 # 7. Non-busy blocking pop (waits up to 10 seconds)
 redis-cli -p 6379 BRPOP jobs 10
 
-# 8. Trigger AOF compaction
+# 8. Manage Dead-Letter Queue (DLQ)
+redis-cli -p 6379 DLQ_LIST jobs
+redis-cli -p 6379 DLQ_REPLAY jobs
+redis-cli -p 6379 DLQ_PURGE jobs
+
+# 9. Trigger AOF compaction
 redis-cli -p 6379 BGREWRITEAOF
 ```
 

@@ -81,9 +81,9 @@ impl Server {
         requirepass: Option<String>,
     ) -> std::io::Result<Self> {
         let aof = Arc::new(AofManager::open(aof_path)?);
-        let restored_queues = aof.replay()?;
-
         let engine = Arc::new(QueueEngine::new());
+        let restored_queues = aof.replay(&engine)?;
+
         {
             let mut inner = engine.inner.write();
             inner.queues = restored_queues;
@@ -588,6 +588,30 @@ pub async fn handle_connection(
                             socket.write_all(&resp_simple_string("OK")).await?;
                         }
 
+                        // List Dead-Letter Queue items
+                        Command::DlqList { queue, limit } => {
+                            let items = ctx.engine.list_dlq(&queue, limit);
+                            let bulk_items: Vec<Vec<u8>> =
+                                items.into_iter().map(|p| resp_bulk_string(&p)).collect();
+                            socket.write_all(&resp_array(&bulk_items)).await?;
+                        }
+
+                        // Purge Dead-Letter Queue items
+                        Command::DlqPurge { queue } => {
+                            let count = ctx.engine.purge_dlq(&queue);
+                            let _ = ctx.aof.append(&raw_frame);
+                            let _ = ctx.replica_stream.send(raw_frame);
+                            socket.write_all(&resp_integer(count as i64)).await?;
+                        }
+
+                        // Re-queue Dead-Letter Queue items back to ready queue
+                        Command::DlqReplay { queue } => {
+                            let count = ctx.engine.requeue_dlq(&queue);
+                            let _ = ctx.aof.append(&raw_frame);
+                            let _ = ctx.replica_stream.send(raw_frame);
+                            socket.write_all(&resp_integer(count as i64)).await?;
+                        }
+
                         Command::Unknown => {
                             socket
                                 .write_all(&resp_error("unknown command or syntax error"))
@@ -778,6 +802,12 @@ pub async fn start_replica_follower(
                                                             let duration =
                                                                 Duration::from_secs_f64(delay_secs.max(0.0));
                                                             engine.lpush_delayed(&queue, duration, payload);
+                                                        }
+                                                        Command::DlqPurge { queue } => {
+                                                            engine.purge_dlq(&queue);
+                                                        }
+                                                        Command::DlqReplay { queue } => {
+                                                            engine.requeue_dlq(&queue);
                                                         }
                                                         _ => {
                                                             tracing::debug!(

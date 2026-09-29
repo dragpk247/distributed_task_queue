@@ -17,6 +17,9 @@ A lightweight, high-performance, pure-Python client and background worker librar
   - `touch(queue, task_id, extend_secs=30.0)` (`TASKTOUCH`)
   - `ack(queue, task_id)` (`TASKACK`)
   - `nack(queue, task_id)` (`TASKNACK`)
+  - `dlq_list(queue, limit=None)` (`DLQ_LIST`)
+  - `dlq_purge(queue)` (`DLQ_PURGE`)
+  - `dlq_replay(queue)` (`DLQ_REPLAY`)
   - `info()` (`INFO` server metrics & queue stats)
 - **Production-Ready Worker Pattern**:
   - `@worker.task` decorator for concise queue handler definition.
@@ -147,6 +150,33 @@ with client:
 
 ---
 
+### 4. Dead-Letter Queue (DLQ) Management
+
+Inspect, replay, or purge dead-lettered tasks that have exceeded their maximum retry limit:
+
+```python
+from dtq import TaskQueueClient
+
+client = TaskQueueClient(host="127.0.0.1", port=6379)
+
+with client:
+    # 1. Inspect tasks in DLQ (optionally pass a limit)
+    dead_tasks = client.dlq_list("orders", limit=10)
+    print(f"DLQ contains {len(dead_tasks)} tasks")
+    for payload in dead_tasks:
+        print("Dead task payload:", payload)
+
+    # 2. Replay all DLQ tasks back into the active queue for processing
+    requeued_count = client.dlq_replay("orders")
+    print(f"Requeued {requeued_count} tasks back into 'orders'")
+
+    # 3. Or purge DLQ tasks permanently
+    purged_count = client.dlq_purge("orders")
+    print(f"Purged {purged_count} tasks from DLQ")
+```
+
+---
+
 ## API Reference
 
 ### `TaskQueueClient`
@@ -165,8 +195,12 @@ TaskQueueClient(host="127.0.0.1", port=6379, password=None, socket_timeout=None)
 - `touch(queue: str, task_id: str, extend_secs: float = 30.0) -> bool`: Extend active lease window (`TASKTOUCH`).
 - `ack(queue: str, task_id: str) -> bool`: Acknowledge completion (`TASKACK`).
 - `nack(queue: str, task_id: str) -> bool`: Negative-acknowledge failure (`TASKNACK`).
+- `dlq_list(queue: str, limit: Optional[int] = None) -> List[bytes]`: Inspect dead-lettered task payloads (`DLQ_LIST`).
+- `dlq_purge(queue: str) -> int`: Purge all dead-lettered tasks (`DLQ_PURGE`).
+- `dlq_replay(queue: str) -> int`: Re-queue dead-lettered tasks back to active queue (`DLQ_REPLAY`).
 - `info() -> Dict[str, Any]`: Retrieve engine metrics and queue stats (`INFO`).
 - `connect()` / `close()`: Manage connection lifecycle. Supports `with` context manager.
+
 
 ### `Worker`
 

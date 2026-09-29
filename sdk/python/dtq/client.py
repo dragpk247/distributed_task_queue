@@ -505,3 +505,40 @@ class TaskQueueClient:
                 result[k] = val
 
         return result
+
+    def dlq_list(self, queue: str, limit: Optional[int] = None) -> List[bytes]:
+        """
+        List dead-letter queue (DLQ) task payloads for the specified queue (DLQ_LIST).
+
+        :param queue: Name of queue.
+        :param limit: Optional maximum number of payloads to return.
+        :return: List of raw payload bytes in the DLQ.
+        """
+        args: List[Union[str, int]] = ["DLQ_LIST", queue]
+        if limit is not None:
+            args.append(limit)
+        res = self.execute_command(*args)
+        if res is None:
+            return []
+        return [item if isinstance(item, bytes) else str(item).encode("utf-8") for item in res]
+
+    def dlq_purge(self, queue: str) -> int:
+        """
+        Purge all dead-letter queue (DLQ) tasks for the specified queue (DLQ_PURGE).
+
+        :param queue: Name of queue.
+        :return: Count of purged items.
+        """
+        res = self.execute_command("DLQ_PURGE", queue)
+        return int(res)
+
+    def dlq_replay(self, queue: str) -> int:
+        """
+        Replay/re-queue all dead-letter queue (DLQ) tasks back to the ready queue (DLQ_REPLAY).
+
+        :param queue: Name of queue.
+        :return: Count of requeued items.
+        """
+        res = self.execute_command("DLQ_REPLAY", queue)
+        return int(res)
+

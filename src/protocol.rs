@@ -90,6 +90,15 @@ pub enum Command {
     /// Demotes or promotes server roles for cluster management (`FAILOVER` / `REPLICAOF NO ONE`).
     Failover,
 
+    /// List payloads residing in the Dead-Letter Queue (`DLQ_LIST <queue> [limit]` / `DLQLIST <queue> [limit]`).
+    DlqList { queue: String, limit: Option<usize> },
+
+    /// Purge all tasks from the Dead-Letter Queue (`DLQ_PURGE <queue>` / `DLQPURGE <queue>`).
+    DlqPurge { queue: String },
+
+    /// Re-queue all tasks from the Dead-Letter Queue back to the ready queue (`DLQ_REPLAY <queue>` / `DLQREPLAY <queue>` / `DLQ_REQUEUE <queue>`).
+    DlqReplay { queue: String },
+
     /// Fallback for unrecognized commands or malformed argument counts.
     Unknown,
 }
@@ -350,6 +359,27 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
             } else {
                 Command::Unknown
             }
+        }
+        "DLQ_LIST" | "DLQLIST" if args.len() == 2 || args.len() == 3 => {
+            let queue = String::from_utf8_lossy(&args[1]).into_owned();
+            let limit = if args.len() == 3 {
+                let limit_str = String::from_utf8_lossy(&args[2]);
+                match limit_str.parse::<usize>() {
+                    Ok(lim) => Some(lim),
+                    Err(_) => return Ok(Some((Command::Unknown, raw_frame))),
+                }
+            } else {
+                None
+            };
+            Command::DlqList { queue, limit }
+        }
+        "DLQ_PURGE" | "DLQPURGE" if args.len() == 2 => {
+            let queue = String::from_utf8_lossy(&args[1]).into_owned();
+            Command::DlqPurge { queue }
+        }
+        "DLQ_REPLAY" | "DLQREPLAY" | "DLQ_REQUEUE" if args.len() == 2 => {
+            let queue = String::from_utf8_lossy(&args[1]).into_owned();
+            Command::DlqReplay { queue }
         }
         _ => Command::Unknown,
     };
@@ -645,5 +675,92 @@ mod tests {
             BytesMut::from("*3\r\n$9\r\nREPLICAOF\r\n$9\r\n127.0.0.1\r\n$4\r\n6379\r\n");
         let (cmd_rep_other, _) = parse_command(&mut buf_rep_other).unwrap().unwrap();
         assert_eq!(cmd_rep_other, Command::Unknown);
+    }
+
+    #[test]
+    fn test_parse_dlq_commands() {
+        // DLQ_LIST without limit
+        let mut buf1 = BytesMut::from("*2\r\n$8\r\nDLQ_LIST\r\n$5\r\ntasks\r\n");
+        let (cmd1, _) = parse_command(&mut buf1).unwrap().unwrap();
+        assert_eq!(
+            cmd1,
+            Command::DlqList {
+                queue: "tasks".to_string(),
+                limit: None,
+            }
+        );
+        assert!(buf1.is_empty());
+
+        // DLQLIST alias with limit
+        let mut buf2 = BytesMut::from("*3\r\n$7\r\nDLQLIST\r\n$5\r\ntasks\r\n$2\r\n50\r\n");
+        let (cmd2, _) = parse_command(&mut buf2).unwrap().unwrap();
+        assert_eq!(
+            cmd2,
+            Command::DlqList {
+                queue: "tasks".to_string(),
+                limit: Some(50),
+            }
+        );
+        assert!(buf2.is_empty());
+
+        // DLQ_LIST invalid limit -> Unknown
+        let mut buf_inv = BytesMut::from("*3\r\n$8\r\nDLQ_LIST\r\n$5\r\ntasks\r\n$3\r\nabc\r\n");
+        let (cmd_inv, _) = parse_command(&mut buf_inv).unwrap().unwrap();
+        assert_eq!(cmd_inv, Command::Unknown);
+
+        // DLQ_PURGE
+        let mut buf3 = BytesMut::from("*2\r\n$9\r\nDLQ_PURGE\r\n$5\r\ntasks\r\n");
+        let (cmd3, _) = parse_command(&mut buf3).unwrap().unwrap();
+        assert_eq!(
+            cmd3,
+            Command::DlqPurge {
+                queue: "tasks".to_string(),
+            }
+        );
+        assert!(buf3.is_empty());
+
+        // DLQPURGE alias
+        let mut buf4 = BytesMut::from("*2\r\n$8\r\nDLQPURGE\r\n$6\r\nfailed\r\n");
+        let (cmd4, _) = parse_command(&mut buf4).unwrap().unwrap();
+        assert_eq!(
+            cmd4,
+            Command::DlqPurge {
+                queue: "failed".to_string(),
+            }
+        );
+        assert!(buf4.is_empty());
+
+        // DLQ_REPLAY
+        let mut buf5 = BytesMut::from("*2\r\n$10\r\nDLQ_REPLAY\r\n$5\r\ntasks\r\n");
+        let (cmd5, _) = parse_command(&mut buf5).unwrap().unwrap();
+        assert_eq!(
+            cmd5,
+            Command::DlqReplay {
+                queue: "tasks".to_string(),
+            }
+        );
+        assert!(buf5.is_empty());
+
+        // DLQREPLAY alias
+        let mut buf6 = BytesMut::from("*2\r\n$9\r\nDLQREPLAY\r\n$5\r\ntasks\r\n");
+        let (cmd6, _) = parse_command(&mut buf6).unwrap().unwrap();
+        assert_eq!(
+            cmd6,
+            Command::DlqReplay {
+                queue: "tasks".to_string(),
+            }
+        );
+        assert!(buf6.is_empty());
+
+        // DLQ_REQUEUE alias
+        let mut buf7 = BytesMut::from("*2\r\n$11\r\nDLQ_REQUEUE\r\n$5\r\ntasks\r\n");
+        let (cmd7, _) = parse_command(&mut buf7).unwrap().unwrap();
+        assert_eq!(
+            cmd7,
+            Command::DlqReplay {
+                queue: "tasks".to_string(),
+            }
+        );
+        assert!(buf7.is_empty());
     }
 }

@@ -546,6 +546,19 @@ impl QueueEngine {
         }
     }
 
+    /// Returns up to `limit` payloads (or all if `None`) from the dead-letter queue (DLQ) for the specified queue.
+    pub fn list_dlq(&self, queue: &str, limit: Option<usize>) -> Vec<Vec<u8>> {
+        let lock = self.inner.read();
+        if let Some(dlq_items) = lock.dead_letter_queues.get(queue) {
+            match limit {
+                Some(lim) => dlq_items.iter().take(lim).cloned().collect(),
+                None => dlq_items.clone(),
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Re-queues all dead-letter queue (DLQ) tasks back to the ready queue for retry.
     /// Returns the number of items requeued.
     pub fn requeue_dlq(&self, queue: &str) -> usize {
@@ -774,6 +787,50 @@ mod tests {
         assert_eq!(purged, 1);
         let stats_purged = engine.get_stats();
         assert_eq!(stats_purged.dlq_counts.get("dlq_test"), None);
+    }
+
+    #[test]
+    fn test_list_dlq() {
+        let engine = QueueEngine::new();
+        // Initially empty
+        assert!(engine.list_dlq("test_q", None).is_empty());
+        assert!(engine.list_dlq("test_q", Some(10)).is_empty());
+
+        // Push two tasks and fail them into DLQ
+        engine.lpush("test_q", b"item1".to_vec());
+        engine.lpush("test_q", b"item2".to_vec());
+
+        // Fail item1 into DLQ (item1 pops first with RPOP / lease because it was pushed first)
+        for i in 1..=3 {
+            let task_id = format!("t1-{}", i);
+            let _ = engine.rpop_with_lease("test_q", task_id.clone(), Duration::from_secs(10));
+            assert!(engine.task_nack("test_q", &task_id));
+        }
+
+        // Fail item2 into DLQ
+        for i in 1..=3 {
+            let task_id = format!("t2-{}", i);
+            let _ = engine.rpop_with_lease("test_q", task_id.clone(), Duration::from_secs(10));
+            assert!(engine.task_nack("test_q", &task_id));
+        }
+
+        // List all items in DLQ
+        let all = engine.list_dlq("test_q", None);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0], b"item1");
+        assert_eq!(all[1], b"item2");
+
+        // List with limit
+        let limited = engine.list_dlq("test_q", Some(1));
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0], b"item1");
+
+        let limited_excess = engine.list_dlq("test_q", Some(10));
+        assert_eq!(limited_excess.len(), 2);
+
+        // Requeue 1 and check DLQ is empty
+        assert_eq!(engine.requeue_dlq("test_q"), 2);
+        assert!(engine.list_dlq("test_q", None).is_empty());
     }
 
     #[test]

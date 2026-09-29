@@ -87,6 +87,9 @@ pub enum Command {
     /// Diagnostic server and queue engine information (`INFO`).
     Info,
 
+    /// Demotes or promotes server roles for cluster management (`FAILOVER` / `REPLICAOF NO ONE`).
+    Failover,
+
     /// Fallback for unrecognized commands or malformed argument counts.
     Unknown,
 }
@@ -338,6 +341,16 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
             Command::Auth { password }
         }
         "INFO" => Command::Info,
+        "FAILOVER" if args.len() == 1 => Command::Failover,
+        "REPLICAOF" if args.len() == 3 => {
+            let arg1 = String::from_utf8_lossy(&args[1]).to_ascii_uppercase();
+            let arg2 = String::from_utf8_lossy(&args[2]).to_ascii_uppercase();
+            if arg1 == "NO" && arg2 == "ONE" {
+                Command::Failover
+            } else {
+                Command::Unknown
+            }
+        }
         _ => Command::Unknown,
     };
 
@@ -598,5 +611,39 @@ mod tests {
         );
         let (cmd_err2, _) = parse_command(&mut buf_err2).unwrap().unwrap();
         assert_eq!(cmd_err2, Command::Unknown);
+    }
+
+    #[test]
+    fn test_parse_failover() {
+        // FAILOVER command
+        let mut buf = BytesMut::from("*1\r\n$8\r\nFAILOVER\r\n");
+        let (cmd, _) = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Failover);
+        assert!(buf.is_empty());
+
+        // failover lowercase
+        let mut buf_lower = BytesMut::from("*1\r\n$8\r\nfailover\r\n");
+        let (cmd_lower, _) = parse_command(&mut buf_lower).unwrap().unwrap();
+        assert_eq!(cmd_lower, Command::Failover);
+        assert!(buf_lower.is_empty());
+
+        // REPLICAOF NO ONE
+        let mut buf_rep = BytesMut::from("*3\r\n$9\r\nREPLICAOF\r\n$2\r\nNO\r\n$3\r\nONE\r\n");
+        let (cmd_rep, _) = parse_command(&mut buf_rep).unwrap().unwrap();
+        assert_eq!(cmd_rep, Command::Failover);
+        assert!(buf_rep.is_empty());
+
+        // replicaof no one mixed case
+        let mut buf_rep_mixed =
+            BytesMut::from("*3\r\n$9\r\nreplicaof\r\n$2\r\nNo\r\n$3\r\nOne\r\n");
+        let (cmd_rep_mixed, _) = parse_command(&mut buf_rep_mixed).unwrap().unwrap();
+        assert_eq!(cmd_rep_mixed, Command::Failover);
+        assert!(buf_rep_mixed.is_empty());
+
+        // REPLICAOF host port should not map to Failover (maps to Unknown for now)
+        let mut buf_rep_other =
+            BytesMut::from("*3\r\n$9\r\nREPLICAOF\r\n$9\r\n127.0.0.1\r\n$4\r\n6379\r\n");
+        let (cmd_rep_other, _) = parse_command(&mut buf_rep_other).unwrap().unwrap();
+        assert_eq!(cmd_rep_other, Command::Unknown);
     }
 }

@@ -296,11 +296,21 @@ async fn test_replica_follower_sync_mode() {
     // Spawn replica follower loop connecting to primary
     let primary_addr_clone = primary_addr.clone();
     let engine_clone = replica_engine.clone();
+    let follower_role = std::sync::Arc::new(parking_lot::RwLock::new(
+        distributed_task_queue::server::NodeRole::Replica {
+            primary_addr: primary_addr_clone.clone(),
+        },
+    ));
+    let follower_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let follower_handle = tokio::spawn(async move {
         distributed_task_queue::server::start_replica_follower(
             primary_addr_clone,
             engine_clone,
             None,
+            follower_role,
+            follower_notify,
+            false,
+            Duration::from_secs(3),
         )
         .await;
     });
@@ -550,4 +560,96 @@ async fn test_task_priority_queue_integration() {
     assert_eq!(&resp[..n], b"$-1\r\n");
 
     let _ = std::fs::remove_file(&aof_path);
+}
+
+#[tokio::test]
+async fn test_manual_failover_promotion() {
+    let primary_port = 16390;
+    let replica_port = 16391;
+
+    let primary_addr = format!("127.0.0.1:{}", primary_port);
+    let primary_aof = std::env::temp_dir().join(format!("test_server_{}.aof", primary_port));
+    let _ = std::fs::remove_file(&primary_aof);
+
+    let replica_addr = format!("127.0.0.1:{}", replica_port);
+    let replica_aof = std::env::temp_dir().join(format!("test_server_{}.aof", replica_port));
+    let _ = std::fs::remove_file(&replica_aof);
+
+    // 1. Start primary server
+    let primary_server = Server::new(&primary_addr, primary_aof.to_str().unwrap()).unwrap();
+    tokio::spawn(async move {
+        let _ = primary_server.run().await;
+    });
+
+    // 2. Start replica server configured with NodeRole::Replica
+    let replica_server = Server::with_role_and_requirepass(
+        &replica_addr,
+        replica_aof.to_str().unwrap(),
+        distributed_task_queue::server::NodeRole::Replica {
+            primary_addr: primary_addr.clone(),
+        },
+        None,
+    )
+    .unwrap();
+
+    let replica_engine = replica_server.get_engine();
+    let replica_ctx = replica_server.get_context();
+    let replica_role = std::sync::Arc::clone(&replica_ctx.role);
+    let replica_notify = std::sync::Arc::clone(&replica_ctx.failover_notify);
+
+    tokio::spawn(async move {
+        let _ = replica_server.run().await;
+    });
+
+    // Spawn replica follower background task
+    let p_addr = primary_addr.clone();
+    tokio::spawn(async move {
+        distributed_task_queue::server::start_replica_follower(
+            p_addr,
+            replica_engine,
+            None,
+            replica_role,
+            replica_notify,
+            false,
+            Duration::from_secs(3),
+        )
+        .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // 3. Connect to replica and check INFO replication role
+    let mut replica_client = TcpStream::connect(&replica_addr).await.unwrap();
+    replica_client
+        .write_all(b"*1\r\n$4\r\nINFO\r\n")
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 1024];
+    let n = replica_client.read(&mut buf).await.unwrap();
+    let info_str = String::from_utf8_lossy(&buf[..n]);
+    assert!(info_str.contains("role:replica"));
+    assert!(info_str.contains(&format!("master_host:{}", primary_addr)));
+
+    // 4. Send FAILOVER command to replica
+    replica_client
+        .write_all(b"*1\r\n$8\r\nFAILOVER\r\n")
+        .await
+        .unwrap();
+
+    let n = replica_client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"+OK\r\n");
+
+    // 5. Query INFO again and verify node is now Master
+    replica_client
+        .write_all(b"*1\r\n$4\r\nINFO\r\n")
+        .await
+        .unwrap();
+    let n = replica_client.read(&mut buf).await.unwrap();
+    let info_after = String::from_utf8_lossy(&buf[..n]);
+    assert!(info_after.contains("role:master"));
+    assert!(!info_after.contains("role:replica"));
+
+    let _ = std::fs::remove_file(&primary_aof);
+    let _ = std::fs::remove_file(&replica_aof);
 }

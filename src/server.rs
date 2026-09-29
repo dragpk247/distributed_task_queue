@@ -15,12 +15,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
+use parking_lot::RwLock;
+
 use crate::aof::AofManager;
 use crate::engine::QueueEngine;
 use crate::protocol::{
     parse_command, resp_array, resp_bulk_string, resp_error, resp_integer, resp_null,
     resp_simple_string, Command,
 };
+
+/// Represents the clustering and replication role of this server node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeRole {
+    /// Active primary master node handling mutations and serving replicas.
+    Master,
+    /// Follower replica node streaming mutations from a designated primary master.
+    Replica { primary_addr: String },
+}
 
 /// Shared state available across all connection handler tasks.
 pub struct ServerContext {
@@ -34,6 +45,10 @@ pub struct ServerContext {
     pub task_counter: AtomicU64,
     /// Optional password required to authenticate client connections.
     pub requirepass: Option<String>,
+    /// Node role (Master or Replica).
+    pub role: Arc<RwLock<NodeRole>>,
+    /// Notification trigger used to wake up and abort follower tasks upon failover promotion.
+    pub failover_notify: Arc<tokio::sync::Notify>,
 }
 
 /// The main distributed task queue TCP server.
@@ -55,6 +70,16 @@ impl Server {
         aof_path: &str,
         requirepass: Option<String>,
     ) -> std::io::Result<Self> {
+        Self::with_role_and_requirepass(addr, aof_path, NodeRole::Master, requirepass)
+    }
+
+    /// Initializes the server with specific role and optional authentication requirement (`requirepass`).
+    pub fn with_role_and_requirepass(
+        addr: &str,
+        aof_path: &str,
+        role: NodeRole,
+        requirepass: Option<String>,
+    ) -> std::io::Result<Self> {
         let aof = Arc::new(AofManager::open(aof_path)?);
         let restored_queues = aof.replay()?;
 
@@ -72,12 +97,19 @@ impl Server {
             replica_stream: replica_tx,
             task_counter: AtomicU64::new(1),
             requirepass,
+            role: Arc::new(RwLock::new(role)),
+            failover_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         Ok(Self {
             addr: addr.to_string(),
             context,
         })
+    }
+
+    /// Access the server context.
+    pub fn get_context(&self) -> Arc<ServerContext> {
+        Arc::clone(&self.context)
     }
 
     /// Access the underlying queue engine (useful for integration testing).
@@ -526,9 +558,34 @@ pub async fn handle_connection(
                                 ));
                             }
 
+                            info_text.push_str("# Replication\r\n");
+                            match &*ctx.role.read() {
+                                NodeRole::Master => {
+                                    info_text.push_str("role:master\r\n");
+                                }
+                                NodeRole::Replica { primary_addr } => {
+                                    info_text.push_str("role:replica\r\n");
+                                    info_text
+                                        .push_str(&format!("master_host:{}\r\n", primary_addr));
+                                }
+                            }
+
                             socket
                                 .write_all(&resp_bulk_string(info_text.as_bytes()))
                                 .await?;
+                        }
+
+                        // Promote replica node to master immediately
+                        Command::Failover => {
+                            {
+                                let mut role_guard = ctx.role.write();
+                                if matches!(*role_guard, NodeRole::Replica { .. }) {
+                                    *role_guard = NodeRole::Master;
+                                    ctx.failover_notify.notify_waiters();
+                                    tracing::info!("Node promoted to Master via FAILOVER command");
+                                }
+                            }
+                            socket.write_all(&resp_simple_string("OK")).await?;
                         }
 
                         Command::Unknown => {
@@ -553,7 +610,20 @@ pub async fn handle_connection(
 
 /// Runs replica follower synchronization loop (alias for [`start_replica_follower`]).
 pub async fn run_replica_sync(primary_addr: String, engine: Arc<QueueEngine>) {
-    start_replica_follower(primary_addr, engine, None).await;
+    let role = Arc::new(parking_lot::RwLock::new(NodeRole::Replica {
+        primary_addr: primary_addr.clone(),
+    }));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    start_replica_follower(
+        primary_addr,
+        engine,
+        None,
+        role,
+        notify,
+        false,
+        Duration::from_secs(3),
+    )
+    .await;
 }
 
 /// Connects to a primary server node and replicates mutation commands (`SYNC`).
@@ -563,130 +633,213 @@ pub async fn run_replica_sync(primary_addr: String, engine: Arc<QueueEngine>) {
 /// (`LPUSH`, `RPOP`, `RPOPLPUSH`, `LPUSHDELAY`), applying each directly to the local
 /// [`QueueEngine`]. If the connection fails or drops, automatically reconnects starting
 /// after 2 seconds with exponential backoff.
+///
+/// If `failover_notify` triggers or `auto_failover` is active and the connection to the primary
+/// is lost for longer than `failover_timeout`, this node is promoted to `NodeRole::Master`.
 pub async fn start_replica_follower(
     primary_addr: String,
     engine: Arc<QueueEngine>,
     master_auth: Option<String>,
+    role: Arc<parking_lot::RwLock<NodeRole>>,
+    failover_notify: Arc<tokio::sync::Notify>,
+    auto_failover: bool,
+    failover_timeout: Duration,
 ) {
-    let mut retry_delay = Duration::from_secs(2);
+    let mut retry_delay = Duration::from_secs(1);
     let max_retry_delay = Duration::from_secs(32);
+    let mut disconnect_start: Option<tokio::time::Instant> = None;
 
     loop {
+        // Check if node is already promoted
+        {
+            if *role.read() == NodeRole::Master {
+                tracing::info!("Replica follower exiting: node role is Master");
+                return;
+            }
+        }
+
         tracing::info!(
             "Connecting to primary replication master at {}",
             primary_addr
         );
-        match TcpStream::connect(&primary_addr).await {
-            Ok(mut stream) => {
-                // If the primary master requires authentication, send AUTH first
-                if let Some(ref pass) = master_auth {
-                    let auth_frame = format!("*2\r\n$4\r\nAUTH\r\n${}\r\n{}\r\n", pass.len(), pass);
-                    if let Err(e) = stream.write_all(auth_frame.as_bytes()).await {
-                        tracing::warn!("Failed to send AUTH to primary: {:?}", e);
-                        tokio::time::sleep(retry_delay).await;
-                        retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
-                        continue;
-                    }
-                }
 
-                tracing::info!("Connected to primary {}. Sending SYNC...", primary_addr);
-                if let Err(e) = stream.write_all(b"*1\r\n$4\r\nSYNC\r\n").await {
-                    tracing::warn!("Failed to send SYNC command to primary: {:?}", e);
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
-                    continue;
-                }
+        tokio::select! {
+            _ = failover_notify.notified() => {
+                tracing::info!("Replica follower notified of failover. Promoting to Master...");
+                *role.write() = NodeRole::Master;
+                return;
+            }
+            conn_res = TcpStream::connect(&primary_addr) => {
+                match conn_res {
+                    Ok(mut stream) => {
+                        // Successfully connected; reset disconnect timer
+                        disconnect_start = None;
 
-                // Reset backoff upon successful handshake
-                retry_delay = Duration::from_secs(2);
-                let mut buffer = BytesMut::with_capacity(4096);
-                let mut chunk = [0u8; 1024];
-
-                loop {
-                    match stream.read(&mut chunk).await {
-                        Ok(0) => {
-                            tracing::warn!("Primary closed replication connection");
-                            break;
-                        }
-                        Ok(n) => {
-                            buffer.extend_from_slice(&chunk[..n]);
-
-                            // Discard status lines such as "+SYNC OK\r\n"
-                            while buffer.starts_with(b"+") || buffer.starts_with(b"-") {
-                                if let Some(pos) = buffer.windows(2).position(|w| w == b"\r\n") {
-                                    buffer.advance(pos + 2);
-                                } else {
-                                    break;
+                        // If the primary master requires authentication, send AUTH first
+                        if let Some(ref pass) = master_auth {
+                            let auth_frame = format!("*2\r\n$4\r\nAUTH\r\n${}\r\n{}\r\n", pass.len(), pass);
+                            let send_auth = stream.write_all(auth_frame.as_bytes());
+                            tokio::select! {
+                                _ = failover_notify.notified() => {
+                                    *role.write() = NodeRole::Master;
+                                    return;
                                 }
-                            }
-
-                            while !buffer.is_empty() {
-                                match parse_command(&mut buffer) {
-                                    Ok(Some((cmd, _))) => match cmd {
-                                        Command::Lpush { queue, payload } => {
-                                            engine.lpush(&queue, payload);
+                                res = send_auth => {
+                                    if let Err(e) = res {
+                                        tracing::warn!("Failed to send AUTH to primary: {:?}", e);
+                                        if disconnect_start.is_none() {
+                                            disconnect_start = Some(tokio::time::Instant::now());
                                         }
-                                        Command::LpushPriority {
-                                            queue,
-                                            priority,
-                                            payload,
-                                        } => {
-                                            engine.lpush_priority(&queue, priority, payload);
-                                        }
-                                        Command::Rpop { queue } => {
-                                            engine.rpop(&queue);
-                                        }
-                                        Command::Rpoplpush {
-                                            source,
-                                            destination,
-                                        } => {
-                                            engine.rpoplpush(&source, &destination);
-                                        }
-                                        Command::LpushDelay {
-                                            queue,
-                                            delay_secs,
-                                            payload,
-                                        } => {
-                                            let duration =
-                                                Duration::from_secs_f64(delay_secs.max(0.0));
-                                            engine.lpush_delayed(&queue, duration, payload);
-                                        }
-                                        _ => {
-                                            tracing::debug!(
-                                                "Ignored non-mutation command in replica follower: {:?}",
-                                                cmd
-                                            );
-                                        }
-                                    },
-                                    Ok(None) => break,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Protocol parse error in replication stream: {:?}",
-                                            e
-                                        );
-                                        buffer.clear();
-                                        break;
+                                        tokio::time::sleep(retry_delay).await;
+                                        retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+                                        continue;
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("Replication read error from primary: {:?}", e);
-                            break;
+
+                        tracing::info!("Connected to primary {}. Sending SYNC...", primary_addr);
+                        let send_sync = stream.write_all(b"*1\r\n$4\r\nSYNC\r\n");
+                        tokio::select! {
+                            _ = failover_notify.notified() => {
+                                *role.write() = NodeRole::Master;
+                                return;
+                            }
+                            res = send_sync => {
+                                if let Err(e) = res {
+                                    tracing::warn!("Failed to send SYNC command to primary: {:?}", e);
+                                    if disconnect_start.is_none() {
+                                        disconnect_start = Some(tokio::time::Instant::now());
+                                    }
+                                    tokio::time::sleep(retry_delay).await;
+                                    retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+                                    continue;
+                                }
+                            }
                         }
+
+                        // Reset backoff upon successful handshake
+                        retry_delay = Duration::from_secs(1);
+                        let mut buffer = BytesMut::with_capacity(4096);
+                        let mut chunk = [0u8; 1024];
+
+                        loop {
+                            tokio::select! {
+                                _ = failover_notify.notified() => {
+                                    tracing::info!("Failover signal received while streaming from primary.");
+                                    *role.write() = NodeRole::Master;
+                                    return;
+                                }
+                                read_res = stream.read(&mut chunk) => {
+                                    match read_res {
+                                        Ok(0) => {
+                                            tracing::warn!("Primary closed replication connection");
+                                            break;
+                                        }
+                                        Ok(n) => {
+                                            buffer.extend_from_slice(&chunk[..n]);
+
+                                            // Discard status lines such as "+SYNC OK\r\n"
+                                            while buffer.starts_with(b"+") || buffer.starts_with(b"-") {
+                                                if let Some(pos) = buffer.windows(2).position(|w| w == b"\r\n") {
+                                                    buffer.advance(pos + 2);
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+
+                                            while !buffer.is_empty() {
+                                                match parse_command(&mut buffer) {
+                                                    Ok(Some((cmd, _))) => match cmd {
+                                                        Command::Lpush { queue, payload } => {
+                                                            engine.lpush(&queue, payload);
+                                                        }
+                                                        Command::LpushPriority {
+                                                            queue,
+                                                            priority,
+                                                            payload,
+                                                        } => {
+                                                            engine.lpush_priority(&queue, priority, payload);
+                                                        }
+                                                        Command::Rpop { queue } => {
+                                                            engine.rpop(&queue);
+                                                        }
+                                                        Command::Rpoplpush {
+                                                            source,
+                                                            destination,
+                                                        } => {
+                                                            engine.rpoplpush(&source, &destination);
+                                                        }
+                                                        Command::LpushDelay {
+                                                            queue,
+                                                            delay_secs,
+                                                            payload,
+                                                        } => {
+                                                            let duration =
+                                                                Duration::from_secs_f64(delay_secs.max(0.0));
+                                                            engine.lpush_delayed(&queue, duration, payload);
+                                                        }
+                                                        _ => {
+                                                            tracing::debug!(
+                                                                "Ignored non-mutation command in replica follower: {:?}",
+                                                                cmd
+                                                            );
+                                                        }
+                                                    },
+                                                    Ok(None) => break,
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Protocol parse error in replication stream: {:?}",
+                                                            e
+                                                        );
+                                                        buffer.clear();
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Replication read error from primary: {:?}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to primary {}: {:?}", primary_addr, e);
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!("Failed to connect to primary {}: {:?}", primary_addr, e);
-            }
+        }
+
+        // Connection dropped or failed
+        let now = tokio::time::Instant::now();
+        let started = disconnect_start.get_or_insert(now);
+        if auto_failover && now.duration_since(*started) >= failover_timeout {
+            tracing::warn!(
+                "Auto-failover timeout ({:?}) reached without primary response. Promoting to Master!",
+                failover_timeout
+            );
+            *role.write() = NodeRole::Master;
+            return;
         }
 
         tracing::info!(
             "Replication connection lost. Reconnecting in {:?}...",
             retry_delay
         );
-        tokio::time::sleep(retry_delay).await;
+
+        tokio::select! {
+            _ = failover_notify.notified() => {
+                tracing::info!("Replica follower notified of failover during reconnect backoff.");
+                *role.write() = NodeRole::Master;
+                return;
+            }
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+
         retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
     }
 }

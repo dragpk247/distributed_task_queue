@@ -209,7 +209,8 @@ sequenceDiagram
 | `BRPOPLPUSH` | `BRPOPLPUSH <source> <dest> <timeout>`| Blocking pop from source and push to destination with timeout |
 | `BGREWRITEAOF` | `BGREWRITEAOF` | Atomically compacts the AOF log from current memory state |
 | `SYNC` | `SYNC` | Subscribes connected replica node to live mutation byte stream |
-| `INFO` | `INFO` | Reports queue metrics, in-flight leases, and DLQ counts |
+| `INFO` | `INFO` | Reports queue metrics, in-flight leases, DLQ counts, and replication role |
+| `FAILOVER` / `REPLICAOF NO ONE` | `FAILOVER` or `REPLICAOF NO ONE` | Promotes follower replica immediately to primary master |
 
 ---
 
@@ -258,6 +259,9 @@ cargo run -- --bind 127.0.0.1:6379 --requirepass secret123 --http-bind 127.0.0.1
 
 # Run replica follower connecting to primary
 cargo run -- --bind 127.0.0.1:6380 --replicaof 127.0.0.1:6379
+
+# Run replica follower with automated leader failover
+cargo run -- --bind 127.0.0.1:6380 --replicaof 127.0.0.1:6379 --auto-failover --failover-timeout-secs 3.0
 ```
 
 ### 📊 Embedded Web Dashboard & Prometheus Metrics

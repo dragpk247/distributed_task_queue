@@ -5,6 +5,7 @@
 
 use clap::Parser;
 use distributed_task_queue::server::{self, Server};
+use std::sync::Arc;
 
 /// CLI Configuration Options parsed from environment and flags.
 #[derive(Parser, Debug)]
@@ -33,6 +34,14 @@ struct Args {
     /// Network interface and TCP port to bind the HTTP metrics and dashboard server to (`<host:port>`)
     #[arg(long)]
     http_bind: Option<String>,
+
+    /// Enable automated failover promotion to master when primary connection is lost
+    #[arg(long, default_value_t = false)]
+    auto_failover: bool,
+
+    /// Disconnect timeout in seconds before auto-promoting replica to master
+    #[arg(long, default_value_t = 3.0)]
+    failover_timeout_secs: f64,
 }
 
 #[tokio::main]
@@ -44,19 +53,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     tracing::info!("Starting Distributed Task Queue engine on {}", args.bind);
 
-    // 3. Instantiate the queue server with optional password security
-    let server = Server::with_requirepass(&args.bind, &args.aof, args.requirepass)?;
+    // 3. Determine initial node role
+    let initial_role = if let Some(ref primary_addr) = args.replicaof {
+        server::NodeRole::Replica {
+            primary_addr: primary_addr.clone(),
+        }
+    } else {
+        server::NodeRole::Master
+    };
+
+    // Instantiate the queue server with configured role and optional password security
+    let server =
+        Server::with_role_and_requirepass(&args.bind, &args.aof, initial_role, args.requirepass)?;
 
     // 4. If --replicaof is specified, spawn the follower replication background worker
     if let Some(primary_addr) = args.replicaof {
         let engine = server.get_engine();
         let master_auth = args.masterauth;
+        let ctx = server.get_context();
+        let role = Arc::clone(&ctx.role);
+        let failover_notify = Arc::clone(&ctx.failover_notify);
+        let auto_failover = args.auto_failover;
+        let failover_timeout =
+            std::time::Duration::from_secs_f64(args.failover_timeout_secs.max(0.1));
+
         tracing::info!(
             "Starting replica follower connecting to primary {}",
             primary_addr
         );
         tokio::spawn(async move {
-            server::start_replica_follower(primary_addr, engine, master_auth).await;
+            server::start_replica_follower(
+                primary_addr,
+                engine,
+                master_auth,
+                role,
+                failover_notify,
+                auto_failover,
+                failover_timeout,
+            )
+            .await;
         });
     }
 

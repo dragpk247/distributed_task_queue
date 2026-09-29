@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 
 use crate::aof::AofManager;
 use crate::engine::QueueEngine;
@@ -32,6 +32,8 @@ pub struct ServerContext {
     pub replica_stream: broadcast::Sender<Vec<u8>>,
     /// Monotonically increasing atomic counter for generating distinct Task IDs (`task-1`, `task-2`, ...).
     pub task_counter: AtomicU64,
+    /// Optional password required to authenticate client connections.
+    pub requirepass: Option<String>,
 }
 
 /// The main distributed task queue TCP server.
@@ -41,9 +43,18 @@ pub struct Server {
 }
 
 impl Server {
-    /// Initializes the server, replays the existing AOF persistence ledger to restore state,
+    /// Initializes the server without authentication, replays the existing AOF persistence ledger,
     /// and configures background channels.
     pub fn new(addr: &str, aof_path: &str) -> std::io::Result<Self> {
+        Self::with_requirepass(addr, aof_path, None)
+    }
+
+    /// Initializes the server with optional authentication requirement (`requirepass`).
+    pub fn with_requirepass(
+        addr: &str,
+        aof_path: &str,
+        requirepass: Option<String>,
+    ) -> std::io::Result<Self> {
         let aof = Arc::new(AofManager::open(aof_path)?);
         let restored_queues = aof.replay()?;
 
@@ -60,6 +71,7 @@ impl Server {
             aof,
             replica_stream: replica_tx,
             task_counter: AtomicU64::new(1),
+            requirepass,
         });
 
         Ok(Self {
@@ -73,7 +85,12 @@ impl Server {
         Arc::clone(&self.context.engine)
     }
 
-    /// Starts the TCP listener event loop and launches the background lease reaper.
+    /// Explicitly flushes the Append-Only File persistence ledger to disk.
+    pub fn flush_aof(&self) -> std::io::Result<()> {
+        self.context.aof.flush()
+    }
+
+    /// Starts the TCP listener event loop, background lease reaper, and delayed task polling loop.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&self.addr).await?;
         tracing::info!("Server listening on {}", self.addr);
@@ -91,18 +108,40 @@ impl Server {
             }
         });
 
-        // Main connection acceptance loop
-        loop {
-            let (socket, client_addr) = listener.accept().await?;
-            tracing::debug!("New connection from: {}", client_addr);
+        // Background worker: Polls and promotes ready delayed tasks every 50ms
+        let engine_delayed = Arc::clone(&self.context.engine);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                interval.tick().await;
+                engine_delayed.pop_ready_delayed_tasks();
+            }
+        });
 
-            let ctx = Arc::clone(&self.context);
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, ctx).await {
-                    tracing::debug!("Connection closed with error: {:?}", e);
+        // Main connection acceptance loop with graceful shutdown signal listener
+        loop {
+            tokio::select! {
+                accept_res = listener.accept() => {
+                    let (socket, client_addr) = accept_res?;
+                    tracing::debug!("New connection from: {}", client_addr);
+
+                    let ctx = Arc::clone(&self.context);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(socket, ctx).await {
+                            tracing::debug!("Connection closed with error: {:?}", e);
+                        }
+                    });
                 }
-            });
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Server received shutdown signal (Ctrl+C). Flushing AOF...");
+                    let _ = self.flush_aof();
+                    break;
+                }
+            }
         }
+
+        let _ = self.flush_aof();
+        Ok(())
     }
 }
 
@@ -112,6 +151,7 @@ pub async fn handle_connection(
     ctx: Arc<ServerContext>,
 ) -> tokio::io::Result<()> {
     let mut buffer = BytesMut::with_capacity(4096);
+    let mut authenticated = ctx.requirepass.is_none();
 
     loop {
         let mut chunk = [0u8; 1024];
@@ -126,6 +166,32 @@ pub async fn handle_connection(
         while !buffer.is_empty() {
             match parse_command(&mut buffer) {
                 Ok(Some((command, raw_frame))) => {
+                    // Check authentication status
+                    if let Command::Auth { password } = &command {
+                        if ctx.requirepass.as_deref() == Some(password.as_str()) {
+                            authenticated = true;
+                            socket.write_all(&resp_simple_string("OK")).await?;
+                        } else if ctx.requirepass.is_none() {
+                            socket
+                                .write_all(&resp_error("ERR Client sent AUTH, but no password is set"))
+                                .await?;
+                        } else {
+                            socket
+                                .write_all(&resp_error(
+                                    "WRONGPASS invalid username-password pair or token",
+                                ))
+                                .await?;
+                        }
+                        continue;
+                    }
+
+                    if !authenticated && !matches!(command, Command::Ping) {
+                        socket
+                            .write_all(&resp_error("NOAUTH Authentication required."))
+                            .await?;
+                        continue;
+                    }
+
                     match command {
                         // Health check
                         Command::Ping => {
@@ -361,6 +427,24 @@ pub async fn handle_connection(
                             socket.write_all(&resp_simple_string("OK")).await?;
                         }
 
+                        // Push item with delayed execution
+                        Command::LpushDelay {
+                            queue,
+                            delay_secs,
+                            payload,
+                        } => {
+                            let duration = Duration::from_secs_f64(delay_secs.max(0.0));
+                            let task_id = ctx.engine.lpush_delayed(&queue, duration, payload.clone());
+                            let _ = ctx.aof.append(&raw_frame);
+                            let _ = ctx.replica_stream.send(raw_frame);
+                            socket.write_all(&resp_integer(task_id as i64)).await?;
+                        }
+
+                        Command::Auth { .. } => {
+                            // Handled before match
+                            socket.write_all(&resp_simple_string("OK")).await?;
+                        }
+
                         Command::Unknown => {
                             socket
                                 .write_all(&resp_error("unknown command or syntax error"))
@@ -378,5 +462,118 @@ pub async fn handle_connection(
                 }
             }
         }
+    }
+}
+
+/// Runs replica follower synchronization loop (alias for [`start_replica_follower`]).
+pub async fn run_replica_sync(primary_addr: String, engine: Arc<QueueEngine>) {
+    start_replica_follower(primary_addr, engine).await;
+}
+
+/// Connects to a primary server node and replicates mutation commands (`SYNC`).
+///
+/// Connects to `primary_addr`, transmits `*1\r\n$4\r\nSYNC\r\n`, and consumes incoming
+/// RESP mutation frames (`LPUSH`, `RPOP`, `RPOPLPUSH`, `LPUSHDELAY`), applying each
+/// directly to the local [`QueueEngine`]. If the connection fails or drops, automatically
+/// reconnects starting after 2 seconds with exponential backoff.
+pub async fn start_replica_follower(primary_addr: String, engine: Arc<QueueEngine>) {
+    let mut retry_delay = Duration::from_secs(2);
+    let max_retry_delay = Duration::from_secs(32);
+
+    loop {
+        tracing::info!("Connecting to primary replication master at {}", primary_addr);
+        match TcpStream::connect(&primary_addr).await {
+            Ok(mut stream) => {
+                tracing::info!("Connected to primary {}. Sending SYNC...", primary_addr);
+                if let Err(e) = stream.write_all(b"*1\r\n$4\r\nSYNC\r\n").await {
+                    tracing::warn!("Failed to send SYNC command to primary: {:?}", e);
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+                    continue;
+                }
+
+                // Reset backoff upon successful handshake
+                retry_delay = Duration::from_secs(2);
+                let mut buffer = BytesMut::with_capacity(4096);
+                let mut chunk = [0u8; 1024];
+
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => {
+                            tracing::warn!("Primary closed replication connection");
+                            break;
+                        }
+                        Ok(n) => {
+                            buffer.extend_from_slice(&chunk[..n]);
+
+                            // Discard status lines such as "+SYNC OK\r\n"
+                            while buffer.starts_with(b"+") || buffer.starts_with(b"-") {
+                                if let Some(pos) = buffer.windows(2).position(|w| w == b"\r\n") {
+                                    buffer.advance(pos + 2);
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            while !buffer.is_empty() {
+                                match parse_command(&mut buffer) {
+                                    Ok(Some((cmd, _))) => match cmd {
+                                        Command::Lpush { queue, payload } => {
+                                            engine.lpush(&queue, payload);
+                                        }
+                                        Command::Rpop { queue } => {
+                                            engine.rpop(&queue);
+                                        }
+                                        Command::Rpoplpush {
+                                            source,
+                                            destination,
+                                        } => {
+                                            engine.rpoplpush(&source, &destination);
+                                        }
+                                        Command::LpushDelay {
+                                            queue,
+                                            delay_secs,
+                                            payload,
+                                        } => {
+                                            let duration = Duration::from_secs_f64(delay_secs.max(0.0));
+                                            engine.lpush_delayed(&queue, duration, payload);
+                                        }
+                                        _ => {
+                                            tracing::debug!(
+                                                "Ignored non-mutation command in replica follower: {:?}",
+                                                cmd
+                                            );
+                                        }
+                                    },
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Protocol parse error in replication stream: {:?}",
+                                            e
+                                        );
+                                        buffer.clear();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Replication read error from primary: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to primary {}: {:?}", primary_addr, e);
+            }
+        }
+
+        tracing::info!(
+            "Replication connection lost. Reconnecting in {:?}...",
+            retry_delay
+        );
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
     }
 }

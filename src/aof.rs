@@ -53,6 +53,12 @@ impl AofManager {
         Ok(())
     }
 
+    /// Explicitly flushes buffered AOF mutations to disk.
+    pub fn flush(&self) -> std::io::Result<()> {
+        let mut lock = self.writer.lock();
+        lock.flush()
+    }
+
     /// Replays the AOF ledger sequentially upon server startup to reconstruct in-memory queues.
     pub fn replay(&self) -> std::io::Result<HashMap<String, VecDeque<TaskItem>>> {
         let mut queues: HashMap<String, VecDeque<TaskItem>> = HashMap::new();

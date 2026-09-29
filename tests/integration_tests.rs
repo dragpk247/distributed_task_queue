@@ -141,3 +141,165 @@ async fn test_lease_heartbeat_and_ack_tcp() {
 
     let _ = std::fs::remove_file(&aof_path);
 }
+
+#[tokio::test]
+async fn test_auth_session_handling() {
+    let addr = "127.0.0.1:16383";
+    let aof_path = std::env::temp_dir().join("test_server_16383.aof");
+    let _ = std::fs::remove_file(&aof_path);
+
+    let server = Server::with_requirepass(
+        addr,
+        aof_path.to_str().unwrap(),
+        Some("supersecret".to_string()),
+    )
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 256];
+
+    // 1. PING should be permitted without authentication
+    client.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"+PONG\r\n");
+
+    // 2. Other commands (LPUSH) should be rejected with NOAUTH
+    client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$5\r\nqueue\r\n$4\r\ndata\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"-NOAUTH Authentication required.\r\n");
+
+    // 3. Incorrect password AUTH should fail with WRONGPASS
+    client
+        .write_all(b"*2\r\n$4\r\nAUTH\r\n$8\r\nwrongpwd\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(
+        &buf[..n],
+        b"-WRONGPASS invalid username-password pair or token\r\n"
+    );
+
+    // 4. Correct password AUTH succeeds with OK
+    client
+        .write_all(b"*2\r\n$4\r\nAUTH\r\n$11\r\nsupersecret\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"+OK\r\n");
+
+    // 5. Subsequent commands now succeed
+    client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$5\r\nqueue\r\n$4\r\ndata\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":1\r\n");
+
+    // 6. Connect to server without password requirement and send AUTH
+    let (noauth_addr, noauth_aof) = start_test_server(16384).await;
+    let mut noauth_client = TcpStream::connect(&noauth_addr).await.unwrap();
+    noauth_client
+        .write_all(b"*2\r\n$4\r\nAUTH\r\n$3\r\nfoo\r\n")
+        .await
+        .unwrap();
+    let n = noauth_client.read(&mut buf).await.unwrap();
+    assert_eq!(
+        &buf[..n],
+        b"-ERR Client sent AUTH, but no password is set\r\n"
+    );
+
+    let _ = std::fs::remove_file(&aof_path);
+    let _ = std::fs::remove_file(&noauth_aof);
+}
+
+#[tokio::test]
+async fn test_delayed_task_polling_integration() {
+    let (addr, aof_path) = start_test_server(16385).await;
+    let mut client = TcpStream::connect(&addr).await.unwrap();
+    let mut buf = [0u8; 256];
+
+    // Push task with 150ms delay
+    client
+        .write_all(b"*4\r\n$10\r\nLPUSHDELAY\r\n$6\r\nfuture\r\n$4\r\n0.15\r\n$11\r\nhello_delay\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":1\r\n"); // Returned task ID 1
+
+    // Immediately pop -> should be empty (None / $-1\r\n)
+    client
+        .write_all(b"*2\r\n$4\r\nRPOP\r\n$6\r\nfuture\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"$-1\r\n");
+
+    // Sleep 200ms to allow the 50ms polling loop to promote the task
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Pop again -> should now return the promoted payload
+    client
+        .write_all(b"*2\r\n$4\r\nRPOP\r\n$6\r\nfuture\r\n")
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"$11\r\nhello_delay\r\n");
+
+    let _ = std::fs::remove_file(&aof_path);
+}
+
+#[tokio::test]
+async fn test_replica_follower_sync_mode() {
+    let (primary_addr, primary_aof) = start_test_server(16386).await;
+
+    // Start a replica server on another port
+    let replica_addr = "127.0.0.1:16387";
+    let replica_aof = std::env::temp_dir().join("test_server_16387.aof");
+    let _ = std::fs::remove_file(&replica_aof);
+
+    let replica_server = Server::new(replica_addr, replica_aof.to_str().unwrap()).unwrap();
+    let replica_engine = replica_server.get_engine();
+
+    // Spawn replica follower loop connecting to primary
+    let primary_addr_clone = primary_addr.clone();
+    let engine_clone = replica_engine.clone();
+    let follower_handle = tokio::spawn(async move {
+        distributed_task_queue::server::start_replica_follower(primary_addr_clone, engine_clone).await;
+    });
+
+    // Spawn replica server
+    tokio::spawn(async move {
+        let _ = replica_server.run().await;
+    });
+
+    // Allow connection and handshake to establish
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Send LPUSH to primary
+    let mut primary_client = TcpStream::connect(&primary_addr).await.unwrap();
+    primary_client
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$11\r\nreplicatedq\r\n$9\r\nsync_item\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 128];
+    let n = primary_client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b":1\r\n");
+
+    // Wait briefly for replication frame to be received and processed by replica
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify replica engine received the replicated item
+    let item = replica_engine.rpop("replicatedq");
+    assert_eq!(item, Some(b"sync_item".to_vec()));
+
+    follower_handle.abort();
+    let _ = std::fs::remove_file(&primary_aof);
+    let _ = std::fs::remove_file(&replica_aof);
+}

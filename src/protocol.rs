@@ -84,6 +84,18 @@ pub enum Command {
     /// Subscribes replica nodes to the live binary mutation stream (`SYNC`).
     Sync,
 
+    /// Push an item with execution delay (`LPUSH_DELAY <queue> <delay_secs> <payload>`).
+    LpushDelay {
+        queue: String,
+        delay_secs: f64,
+        payload: Vec<u8>,
+    },
+
+    /// Authenticate client connection (`AUTH <password>`).
+    Auth {
+        password: String,
+    },
+
     /// Fallback for unrecognized commands or malformed argument counts.
     Unknown,
 }
@@ -274,6 +286,25 @@ pub fn parse_command(buffer: &mut BytesMut) -> Result<Option<(Command, Vec<u8>)>
         "BGREWRITEAOF" => Command::BgRewriteAof,
         "SYNC" => Command::Sync,
         "REPLCONF" => Command::ReplConf,
+        "LPUSH_DELAY" | "LPUSHDELAY" if args.len() == 4 => {
+            let queue = String::from_utf8_lossy(&args[1]).into_owned();
+            let delay_str = String::from_utf8_lossy(&args[2]);
+            match delay_str.parse::<f64>() {
+                Ok(delay_secs) => {
+                    let payload = args[3].clone();
+                    Command::LpushDelay {
+                        queue,
+                        delay_secs,
+                        payload,
+                    }
+                }
+                Err(_) => Command::Unknown,
+            }
+        }
+        "AUTH" if args.len() == 2 => {
+            let password = String::from_utf8_lossy(&args[1]).into_owned();
+            Command::Auth { password }
+        }
         _ => Command::Unknown,
     };
 
@@ -285,9 +316,13 @@ pub fn resp_simple_string(msg: &str) -> Vec<u8> {
     format!("+{}\r\n", msg).into_bytes()
 }
 
-/// Serializes a RESP Error (`-ERR <msg>\r\n`)
+/// Serializes a RESP Error (`-ERR <msg>\r\n` or custom error prefix)
 pub fn resp_error(msg: &str) -> Vec<u8> {
-    format!("-ERR {}\r\n", msg).into_bytes()
+    if msg.starts_with("ERR ") || msg.starts_with("WRONGPASS ") || msg.starts_with("NOAUTH ") {
+        format!("-{}\r\n", msg).into_bytes()
+    } else {
+        format!("-ERR {}\r\n", msg).into_bytes()
+    }
 }
 
 /// Serializes a RESP Bulk String (`$<len>\r\n<data>\r\n`)
@@ -444,5 +479,38 @@ mod tests {
                 extend_secs: 15.0,
             }
         );
+    }
+
+    #[test]
+    fn test_parse_lpush_delay() {
+        let mut buf = BytesMut::from("*4\r\n$11\r\nLPUSH_DELAY\r\n$5\r\ntasks\r\n$3\r\n2.5\r\n$11\r\nhello world\r\n");
+        let (cmd, _) = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::LpushDelay {
+                queue: "tasks".to_string(),
+                delay_secs: 2.5,
+                payload: b"hello world".to_vec(),
+            }
+        );
+        assert!(buf.is_empty());
+
+        // Invalid delay format should map to Unknown
+        let mut buf_err = BytesMut::from("*4\r\n$11\r\nLPUSH_DELAY\r\n$5\r\ntasks\r\n$3\r\nabc\r\n$4\r\ntest\r\n");
+        let (cmd_err, _) = parse_command(&mut buf_err).unwrap().unwrap();
+        assert_eq!(cmd_err, Command::Unknown);
+    }
+
+    #[test]
+    fn test_parse_auth() {
+        let mut buf = BytesMut::from("*2\r\n$4\r\nAUTH\r\n$8\r\nsecret42\r\n");
+        let (cmd, _) = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Auth {
+                password: "secret42".to_string(),
+            }
+        );
+        assert!(buf.is_empty());
     }
 }

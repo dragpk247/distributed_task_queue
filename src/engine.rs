@@ -7,7 +7,7 @@
 //! - Automatic Dead-Letter Queue (DLQ) routing upon exceeding maximum retries.
 //! - Non-busy event-driven notification channels (`tokio::sync::broadcast`) for async `BRPOP` workers.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::RwLock;
@@ -43,6 +43,48 @@ pub struct InFlightTask {
     pub visibility_timeout: Duration,
 }
 
+/// A scheduled task delayed until a future instant.
+///
+/// Implements [`Ord`] and [`PartialOrd`] in reverse order so that
+/// [`BinaryHeap<DelayedTask>`] acts as a Min-Heap ordered by `execute_at`
+/// (earliest deadline pops first).
+#[derive(Debug, Clone)]
+pub struct DelayedTask {
+    /// Monotonically assigned unique identifier for the delayed task.
+    pub id: u64,
+    /// Target queue where the task will be pushed once ready.
+    pub queue: String,
+    /// Raw payload bytes to enqueue.
+    pub payload: Vec<u8>,
+    /// Future instant after which the task is eligible for promotion.
+    pub execute_at: Instant,
+}
+
+impl PartialEq for DelayedTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.execute_at == other.execute_at && self.id == other.id
+    }
+}
+
+impl Eq for DelayedTask {}
+
+impl Ord for DelayedTask {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering so BinaryHeap functions as a min-heap by execute_at,
+        // using id as a secondary tie-breaker (smaller id first).
+        other
+            .execute_at
+            .cmp(&self.execute_at)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+
+impl PartialOrd for DelayedTask {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Internal shared mutable state protected by a read-write lock.
 #[derive(Default)]
 pub struct EngineInner {
@@ -52,6 +94,10 @@ pub struct EngineInner {
     pub in_flight: HashMap<String, HashMap<String, InFlightTask>>,
     /// Mapping: `queue_name` -> list of permanently failed task payloads (DLQ).
     pub dead_letter_queues: HashMap<String, Vec<Vec<u8>>>,
+    /// Priority min-heap storing pending delayed tasks ordered by scheduled execution time.
+    pub delayed_tasks: BinaryHeap<DelayedTask>,
+    /// Monotonically increasing counter for assigning unique delayed task identifiers.
+    pub delayed_counter: u64,
 }
 
 /// The core concurrent queue engine.
@@ -362,6 +408,67 @@ impl QueueEngine {
 
         reaped
     }
+
+    /// Schedules a task to be pushed after a specified delay duration (`LPUSH_DELAY`).
+    ///
+    /// Stores the task in an in-memory priority min-heap ordered by `execute_at`.
+    /// Returns the unique delayed task identifier assigned to it.
+    pub fn lpush_delayed(&self, queue: &str, delay: Duration, payload: Vec<u8>) -> u64 {
+        let execute_at = Instant::now() + delay;
+        let mut lock = self.inner.write();
+        lock.delayed_counter += 1;
+        let id = lock.delayed_counter;
+        let task = DelayedTask {
+            id,
+            queue: queue.to_string(),
+            payload,
+            execute_at,
+        };
+        lock.delayed_tasks.push(task);
+        id
+    }
+
+    /// Pops and promotes all scheduled delayed tasks whose execution deadline has passed (`execute_at <= Instant::now()`).
+    ///
+    /// For each ready task:
+    /// 1. Prepends the task item to `inner.queues` for that queue.
+    /// 2. Emits a notification on `inner.notifier` to wake up blocking workers (e.g. `BRPOP`).
+    ///
+    /// Returns a vector of promoted tasks as `(queue_name, payload)`.
+    pub fn pop_ready_delayed_tasks(&self) -> Vec<(String, Vec<u8>)> {
+        let now = Instant::now();
+        let mut promoted = Vec::new();
+        let mut notifications = Vec::new();
+
+        {
+            let mut lock = self.inner.write();
+            while let Some(task) = lock.delayed_tasks.peek() {
+                if task.execute_at <= now {
+                    let task = lock.delayed_tasks.pop().unwrap();
+                    let item = TaskItem {
+                        payload: task.payload.clone(),
+                        retry_count: 0,
+                        max_retries: DEFAULT_MAX_RETRIES,
+                    };
+                    lock.queues
+                        .entry(task.queue.clone())
+                        .or_default()
+                        .push_front(item);
+                    notifications.push(task.queue.clone());
+                    promoted.push((task.queue, task.payload));
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Notify waiting workers for each queue that received promoted tasks
+        for q in notifications {
+            let _ = self.notifier.send(q);
+        }
+
+        promoted
+    }
 }
 
 #[cfg(test)]
@@ -436,5 +543,63 @@ mod tests {
         assert!(dlq.is_some(), "DLQ should exist for 'work'");
         assert_eq!(dlq.unwrap().len(), 1);
         assert_eq!(dlq.unwrap()[0], b"critical_task");
+    }
+
+    #[test]
+    fn test_delayed_tasks_heap_order() {
+        let engine = QueueEngine::new();
+        // Schedule three tasks with different delays
+        let id1 = engine.lpush_delayed("q1", Duration::from_millis(200), b"task200".to_vec());
+        let id2 = engine.lpush_delayed("q1", Duration::from_millis(50), b"task50".to_vec());
+        let id3 = engine.lpush_delayed("q1", Duration::from_millis(100), b"task100".to_vec());
+
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+
+        // Before any delay elapses, none should be popped
+        let ready = engine.pop_ready_delayed_tasks();
+        assert!(ready.is_empty());
+
+        // Sleep to allow all tasks to become ready
+        std::thread::sleep(Duration::from_millis(220));
+
+        let promoted = engine.pop_ready_delayed_tasks();
+        assert_eq!(promoted.len(), 3);
+        // The earliest task (task50) was popped first, then task100, then task200
+        assert_eq!(promoted[0], ("q1".to_string(), b"task50".to_vec()));
+        assert_eq!(promoted[1], ("q1".to_string(), b"task100".to_vec()));
+        assert_eq!(promoted[2], ("q1".to_string(), b"task200".to_vec()));
+
+        // In the queue, they were prepended sequentially (LPUSH),
+        // so RPOP (from the back) pops the first one pushed: task50, then task100, then task200
+        assert_eq!(engine.rpop("q1"), Some(b"task50".to_vec()));
+        assert_eq!(engine.rpop("q1"), Some(b"task100".to_vec()));
+        assert_eq!(engine.rpop("q1"), Some(b"task200".to_vec()));
+        assert_eq!(engine.rpop("q1"), None);
+    }
+
+    #[tokio::test]
+    async fn test_delayed_task_notifies_brpop() {
+        let engine = Arc::new(QueueEngine::new());
+        let engine_clone = Arc::clone(&engine);
+
+        // Schedule delayed task with 50ms delay
+        engine.lpush_delayed("delayed_q", Duration::from_millis(50), b"delayed_item".to_vec());
+
+        // Worker waiting with BRPOP
+        let handle = tokio::spawn(async move {
+            engine_clone
+                .brpop(&["delayed_q".to_string()], Duration::from_millis(500))
+                .await
+        });
+
+        // Sleep 60ms and promote
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let promoted = engine.pop_ready_delayed_tasks();
+        assert_eq!(promoted.len(), 1);
+
+        let result = handle.await.unwrap();
+        assert_eq!(result, Some(("delayed_q".to_string(), b"delayed_item".to_vec())));
     }
 }

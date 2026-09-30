@@ -4,6 +4,13 @@ A high-performance, asynchronous distributed task queue engine built in Rust, po
 
 ---
 
+## 📺 Video Walkthrough & Demo
+
+[![Distributed Task Queue Walkthrough](https://img.youtube.com/vi/3CFhrjZZf6Y/maxresdefault.jpg)](https://www.youtube.com/watch?v=3CFhrjZZf6Y)
+
+
+---
+
 ## ⚡ Overview
 
 `distributed_task_queue` is a lightweight, low-latency distributed task broker and coordination engine. It implements an asynchronous TCP event loop, complete RESP wire protocol parsing, atomic queue primitives, visibility timeouts with Dead-Letter Queues (DLQ), Append-Only File (AOF) persistence with background compaction (`BGREWRITEAOF`), and live primary-to-replica mutation streaming.

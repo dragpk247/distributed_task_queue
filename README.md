@@ -28,6 +28,32 @@ A high-performance, asynchronous distributed task queue engine built in Rust, po
 
 ---
 
+## 🎯 Target Use Cases
+
+`distributed_task_queue` bridges the gap between simple in-memory Redis lists and heavy, complex message brokers like RabbitMQ or Apache Kafka. Here are 5 practical real-world scenarios where it excels:
+
+### 1. Reliable Asynchronous Background Job Processing (Celery/Sidekiq Alternative)
+- **The Challenge**: Standard Redis `LPUSH`/`RPOP` lacks reliability—if a worker crashes while processing an image, sending a transactional email, or generating a PDF report, the task payload is lost forever.
+- **How DTQ Solves It**: Workers claim jobs using `RPOPLEASE` / `BRPOPLEASE`. If the worker process panics or drops connection, the background **Lease Reaper** automatically reclaims the unacknowledged job after its visibility timeout and re-queues it for healthy workers.
+
+### 2. Microservice Decoupling & Rate-Limited API Ingestion
+- **The Challenge**: Sudden traffic spikes (e.g., webhook notifications from Stripe or Shopify) can overwhelm backend databases and downstream microservices.
+- **How DTQ Solves It**: Ingestion gateways push payloads to DTQ at ultra-low sub-millisecond latencies. Downstream worker pools consume tasks at a controlled, sustainable rate using blocking event-driven `BRPOP`, preventing CPU spin and database saturation.
+
+### 3. Priority & SLA-Tiered Workload Scheduling
+- **The Challenge**: Enterprise workloads often require VIP user requests (e.g., immediate payment checkout, fraud analysis) to jump ahead of bulk batch tasks (e.g., end-of-day analytics, newsletter campaigns).
+- **How DTQ Solves It**: With `LPUSH_PRIORITY`, high-priority jobs (e.g., `priority=10`) are automatically dequeued before standard or low-priority jobs (e.g., `priority=0`), while maintaining strict FIFO order within each priority tier.
+
+### 4. Scheduled & Delayed Execution (Follow-ups & Reminder Workflows)
+- **The Challenge**: Many business workflows require delayed execution (e.g., *"Send user onboarding check-in 2 hours after sign-up"* or *"Retry payment authorization after 30 minutes"*).
+- **How DTQ Solves It**: `LPUSH_DELAY` places tasks into an in-memory priority min-heap. When the timestamp arrives, the server automatically promotes the task into the ready queue, immediately waking up awaiting workers without requiring external crons or polling loops.
+
+### 5. Resilient Poison-Pill Quarantine & Manual Ops Intervention (DLQ)
+- **The Challenge**: Malformed payloads or corrupt third-party responses can cause workers to crash in an infinite crash-and-retry loop (poison pills), blocking whole queue partitions.
+- **How DTQ Solves It**: DTQ tracks retries (`TASKNACK`). Once maximum attempts are exceeded, the job is quarantined into a Dead-Letter Queue. Operators can inspect failed payloads with `DLQ_LIST`, safely purge invalid items with `DLQ_PURGE`, or replay fixed payloads back to production with `DLQ_REPLAY` without database surgery or service restarts.
+
+---
+
 ## 🏛️ Layered System Architecture
 
 The project is structured into 6 clear, decoupled architectural layers:

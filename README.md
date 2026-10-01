@@ -6,7 +6,7 @@ A high-performance, asynchronous distributed task queue engine built in Rust, po
 
 ## 📺 Video Walkthrough & Demo
 
-[![Distributed Task Queue Walkthrough](https://img.youtube.com/vi/3CFhrjZZf6Y/maxresdefault.jpg)](https://www.youtube.com/watch?v=3CFhrjZZf6Y)
+[![Distributed Task Queue Walkthrough](https://img.youtube.com/vi/MNpt1yQvwDI/maxresdefault.jpg)](https://youtu.be/MNpt1yQvwDI)
 
 
 ---
